@@ -130,6 +130,7 @@ npm run ios          # åpner i iOS Simulator
 4. **Test på iOS** – Appen er primært for iPhone, test alltid at ting fungerer i Simulator
 5. **Små steg** – Gjør én ting om gangen, forklar hva som skjedde, og vent på bekreftelse før neste steg
 6. **Spør ved tvil** – Hvis noe er uklart om design, funksjonalitet eller prioritering – spør Helene
+7. **Henrik Brendhagen** (Helenes kollega) kan spørres hvis dere ikke finner ut av ting. 
 
 ---
 
