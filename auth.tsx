@@ -14,6 +14,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { createURL } from 'expo-linking';
 
 /**
  * Global auth-state for appen.
@@ -63,6 +64,32 @@ const CHAT_CONFIG_KEY = 'training-log-ios:chat-config:v1';
 const OAUTH_RETURN_TOKEN_KEY = 'training-log-ios:oauth-return-token';
 const SERVER_PORT = 8787;
 const KNOWN_DEV_BUNDLER_PORTS = new Set(['8081', '8082', '19000', '19001', '19002', '19006', '4173']);
+
+/** Expo Go / dev-klient: få Strava-callback til å åpne appen igjen i stedet for web-SPA på Vercel. */
+function appendNativeStravaReturnTo(url: string): string {
+  if (Platform.OS === 'web') return url;
+  try {
+    const returnTo = createURL('/');
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}return_to=${encodeURIComponent(returnTo)}`;
+  } catch {
+    return url;
+  }
+}
+
+/** Session-token fra Strava success-siden (exp://…?auth=ok&token=…). */
+function parseStravaOAuthReturnToken(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    const t = u.searchParams.get('token');
+    const authOk = u.searchParams.get('auth') === 'ok';
+    if (t && authOk) return t;
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 /** Module-level mirror som `apiFetch` bruker for å injecte Authorization-headeren. */
 let currentSessionToken: string | null = null;
@@ -480,6 +507,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
+      let tokenFromDeepLink: string | null = null;
+      if (Platform.OS !== 'web') {
+        try {
+          tokenFromDeepLink = parseStravaOAuthReturnToken(await Linking.getInitialURL());
+        } catch {
+          // ignore
+        }
+      }
+
       const tryApplyValidSession = async (
         token: string,
       ): Promise<'ok' | 'invalid' | 'offline'> => {
@@ -519,7 +555,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       };
 
-      const effectiveToken = tokenFromQuery || tokenFromOAuthStorage || storedToken;
+      const effectiveToken = tokenFromQuery || tokenFromOAuthStorage || tokenFromDeepLink || storedToken;
       if (effectiveToken) {
         const outcome = await tryApplyValidSession(effectiveToken);
         if (outcome === 'ok') {
@@ -556,6 +592,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (bootstrapSeqRef.current !== seq) return;
       await applyAuth({ sessionToken: null, user: null });
     })();
+  }, [applyAuth]);
+
+  // Strava OAuth fullført i nettleser → åpner exp:// med token; fanget når appen allerede kjører.
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    const onUrl = async ({ url }: { url: string }) => {
+      const t = parseStravaOAuthReturnToken(url);
+      if (!t) return;
+      currentSessionToken = t;
+      try {
+        const resp = await apiFetch('/auth/me', { ignoreAuthFailure: true });
+        if (resp.ok) {
+          const data = (await resp.json()) as { user: AuthUser };
+          await applyAuth({ sessionToken: t, user: data.user });
+        }
+      } catch {
+        // ignore
+      }
+    };
+    const sub = Linking.addEventListener('url', onUrl);
+    return () => sub.remove();
   }, [applyAuth]);
 
   // Persistér server-url endringer.
@@ -598,7 +655,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     const base = absoluteApiUrl(serverUrl, '/strava/connect');
     const sep = base.includes('?') ? '&' : '?';
-    const url = `${base}${sep}token=${encodeURIComponent(tok)}`;
+    const url = appendNativeStravaReturnTo(`${base}${sep}token=${encodeURIComponent(tok)}`);
     try {
       if (Platform.OS === 'web' && typeof window !== 'undefined') {
         window.location.href = url;
@@ -612,7 +669,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   /** OAuth uten Bearer – samme callback som «koble til» men intent login (ny eller eksisterende Strava-bruker). */
   const openStravaLogin = useCallback(async () => {
-    const url = absoluteApiUrl(serverUrl, '/strava/login');
+    const url = appendNativeStravaReturnTo(absoluteApiUrl(serverUrl, '/strava/login'));
     try {
       if (Platform.OS === 'web' && typeof window !== 'undefined') {
         window.location.href = url;

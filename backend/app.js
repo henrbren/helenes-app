@@ -136,22 +136,34 @@ function stravaRedirectUri(req) {
   return `${selfBaseUrl(req)}/strava/callback`;
 }
 
-/**
- * Etter Strava-callback må SPA åpnes på samme origin som startet OAuth. Callback
- * kjører ofte på produksjonsdomenet mens brukeren kom fra en preview-URL — uten
- * dette lander de på prod med riktig token, men går tilbake til preview og får
- * en annen anonym bruker uten Strava-tokens (STRAVA_NOT_CONNECTED).
- *
- * Verdien kommer kun fra vår egen createOAuthState (Redis) — vi validerer som URL.
- */
-function appRootAfterStravaOAuth(statePayload) {
-  const raw = typeof statePayload.returnBaseUrl === 'string' ? statePayload.returnBaseUrl.trim() : '';
-  if (!raw) return '/';
+function isExpoGoStyleHost(host) {
+  const h = String(host).toLowerCase();
+  if (h === 'localhost' || h === '127.0.0.1') return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  return /^(.*\.)?(exp\.direct|exp\.host|expo\.io|expo\.test|expo\.dev)$/i.test(h);
+}
+
+/** https (prod/preview), http localhost, og exp:// for Expo Go — annet avvises (unngår åpen redirect). */
+function tryNormalizeStravaReturnUrl(raw) {
   try {
     const u = new URL(raw);
-    if (u.username || u.password) return '/';
+    if (u.username || u.password) return null;
     const host = u.hostname.toLowerCase();
-    if (!host || host.length > 253) return '/';
+    if (!host || host.length > 253) return null;
+
+    if (u.protocol === 'exp:' || u.protocol === 'exps:') {
+      if (!isExpoGoStyleHost(host)) return null;
+      let path = u.pathname || '';
+      if (!path || path === '/') {
+        path = '/--/';
+      } else if (!path.endsWith('/')) {
+        path = `${path}/`;
+      }
+      return `${u.protocol}//${u.host}${path}`;
+    }
+
     const local = host === 'localhost' || host === '127.0.0.1';
     if (local && (u.protocol === 'http:' || u.protocol === 'https:')) {
       return `${u.origin}/`;
@@ -159,10 +171,33 @@ function appRootAfterStravaOAuth(statePayload) {
     if (u.protocol === 'https:') {
       return `${u.origin}/`;
     }
-    return '/';
+    return null;
   } catch {
-    return '/';
+    return null;
   }
+}
+
+/**
+ * Etter Strava-callback: redirect tilbake til riktig klient.
+ * - Web: vanligvis prod/preview-https (return_to utelatt → selfBaseUrl).
+ * - Expo Go: klient sender ?return_to=exp://… som valideres og lagres i OAuth-state.
+ */
+function stravaOAuthReturnBase(req) {
+  const q = req.query?.return_to;
+  const raw = Array.isArray(q) ? q[0] : q;
+  if (typeof raw === 'string' && raw.trim()) {
+    const n = tryNormalizeStravaReturnUrl(raw.trim());
+    if (n) return n;
+  }
+  return `${selfBaseUrl(req)}/`;
+}
+
+function appRootAfterStravaOAuth(statePayload) {
+  const raw = typeof statePayload.returnBaseUrl === 'string' ? statePayload.returnBaseUrl.trim() : '';
+  if (!raw) return '/';
+  const n = tryNormalizeStravaReturnUrl(raw);
+  if (n) return n;
+  return '/';
 }
 
 // ---- Auth routes -----------------------------------------------------------
@@ -175,7 +210,7 @@ app.get('/strava/login', async (req, res) => {
     const state = await createOAuthState({
       intent: 'login',
       redirectUri,
-      returnBaseUrl: selfBaseUrl(req),
+      returnBaseUrl: stravaOAuthReturnBase(req),
     });
     const url = buildAuthorizeUrl({ redirectUri, state });
     res.redirect(url);
@@ -192,7 +227,7 @@ app.get('/strava/connect', requireAuth, async (req, res) => {
       intent: 'connect',
       userId: req.user.id,
       redirectUri,
-      returnBaseUrl: selfBaseUrl(req),
+      returnBaseUrl: stravaOAuthReturnBase(req),
     });
     const url = buildAuthorizeUrl({ redirectUri, state });
     res.redirect(url);
