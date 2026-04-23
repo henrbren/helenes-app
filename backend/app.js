@@ -134,6 +134,35 @@ function stravaRedirectUri(req) {
   return `${selfBaseUrl(req)}/strava/callback`;
 }
 
+/**
+ * Etter Strava-callback må SPA åpnes på samme origin som startet OAuth. Callback
+ * kjører ofte på produksjonsdomenet mens brukeren kom fra en preview-URL — uten
+ * dette lander de på prod med riktig token, men går tilbake til preview og får
+ * en annen anonym bruker uten Strava-tokens (STRAVA_NOT_CONNECTED).
+ *
+ * Verdien kommer kun fra vår egen createOAuthState (Redis) — vi validerer som URL.
+ */
+function appRootAfterStravaOAuth(statePayload) {
+  const raw = typeof statePayload.returnBaseUrl === 'string' ? statePayload.returnBaseUrl.trim() : '';
+  if (!raw) return '/';
+  try {
+    const u = new URL(raw);
+    if (u.username || u.password) return '/';
+    const host = u.hostname.toLowerCase();
+    if (!host || host.length > 253) return '/';
+    const local = host === 'localhost' || host === '127.0.0.1';
+    if (local && (u.protocol === 'http:' || u.protocol === 'https:')) {
+      return `${u.origin}/`;
+    }
+    if (u.protocol === 'https:') {
+      return `${u.origin}/`;
+    }
+    return '/';
+  } catch {
+    return '/';
+  }
+}
+
 // ---- Auth routes -----------------------------------------------------------
 app.use(createAuthRouter({ stravaRedirectUri }));
 
@@ -145,6 +174,7 @@ app.get('/strava/connect', requireAuth, async (req, res) => {
       intent: 'connect',
       userId: req.user.id,
       redirectUri,
+      returnBaseUrl: selfBaseUrl(req),
     });
     const url = buildAuthorizeUrl({ redirectUri, state });
     res.redirect(url);
@@ -217,6 +247,7 @@ app.get('/strava/callback', async (req, res) => {
     const athleteName = [athlete?.firstname, athlete?.lastname].filter(Boolean).join(' ').trim() || null;
 
     res.set('Content-Type', 'text/html; charset=utf-8');
+    const webBaseForApp = appRootAfterStravaOAuth(statePayload);
 
     if (statePayload.intent === 'login') {
       // Finn eksisterende konto eller opprett ny basert på Strava athleteId.
@@ -235,7 +266,7 @@ app.get('/strava/callback', async (req, res) => {
       res.setHeader('Set-Cookie', buildSessionCookie(sessionToken));
       res.send(
         successRedirectHtml({
-          webBase: '/',
+          webBase: webBaseForApp,
           queryParams: { auth: 'ok', token: sessionToken, strava: 'connected' },
           message: `Velkommen${athlete?.firstname ? ', ' + athlete.firstname : ''}!`,
         }),
@@ -259,7 +290,7 @@ app.get('/strava/callback', async (req, res) => {
       res.setHeader('Set-Cookie', buildSessionCookie(sessionToken));
       res.send(
         successRedirectHtml({
-          webBase: '/',
+          webBase: webBaseForApp,
           queryParams: { auth: 'ok', token: sessionToken, strava: 'connected' },
           message: 'Strava er koblet til kontoen din',
         }),
