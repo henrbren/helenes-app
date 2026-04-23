@@ -1,7 +1,19 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, Alert, Linking, Platform, StyleSheet, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Alert,
+  KeyboardAvoidingView,
+  Linking,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 
 /**
  * Global auth-state for appen.
@@ -31,7 +43,12 @@ type AuthContextValue = {
   user: AuthUser | null;
   sessionToken: string | null;
   openStravaConnect: () => Promise<void>;
+  openStravaLogin: () => Promise<void>;
   refreshUser: () => Promise<void>;
+  signInWithPassword: (email: string, password: string) => Promise<void>;
+  registerWithPassword: (email: string, password: string) => Promise<void>;
+  continueAsGuest: () => Promise<void>;
+  signOut: () => Promise<void>;
   serverUrl: string;
   setServerUrl: (url: string) => void;
   resetToDefaultServerUrl: () => void;
@@ -386,7 +403,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await applyAuth({ sessionToken: data.sessionToken, user: data.user });
   }, [applyAuth]);
 
-  // Globalt 401-håndtak: opprett ny anonym økt (én om gangen + kort cooldown).
+  // Globalt 401-håndtak: sesjon utløpt/ugyldig → tilbake til innlogging (Redis-sesjoner er server-sant).
   useEffect(() => {
     onUnauthenticated = () => {
       const now = Date.now();
@@ -395,8 +412,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       authRecoveryCooldownUntil = now + 2500;
       void (async () => {
         try {
-          await bootstrapAnonymous();
-        } catch {
           await applyAuth({ sessionToken: null, user: null });
         } finally {
           authRecoveryBusy = false;
@@ -406,9 +421,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => {
       onUnauthenticated = null;
     };
-  }, [applyAuth, bootstrapAnonymous]);
+  }, [applyAuth]);
 
-  // Første oppstart: valider lagret token, ellers anonym økt.
+  // Første oppstart: valider lagret token, ellers innloggingsskjerm (e-post/passord eller gjest).
   useEffect(() => {
     (async () => {
       const [{ sessionToken: storedToken, user: storedUser }, savedServer] = await Promise.all([
@@ -468,13 +483,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
-      try {
-        await bootstrapAnonymous();
-      } catch {
-        await applyAuth({ sessionToken: null, user: null });
-      }
+      await applyAuth({ sessionToken: null, user: null });
     })();
-  }, [applyAuth, bootstrapAnonymous]);
+  }, [applyAuth]);
 
   // Persistér server-url endringer.
   useEffect(() => {
@@ -508,6 +519,75 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [serverUrl]);
 
+  /** OAuth uten Bearer – samme callback som «koble til» men intent login (ny eller eksisterende Strava-bruker). */
+  const openStravaLogin = useCallback(async () => {
+    const url = absoluteApiUrl(serverUrl, '/strava/login');
+    try {
+      if (Platform.OS === 'web' && typeof window !== 'undefined') {
+        window.location.href = url;
+        return;
+      }
+      await Linking.openURL(url);
+    } catch (e: any) {
+      Alert.alert('Kunne ikke starte Strava-innlogging', String(e?.message || e));
+    }
+  }, [serverUrl]);
+
+  const signInWithPassword = useCallback(
+    async (email: string, password: string) => {
+      const resp = await apiFetch('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim(), password }),
+        skipAuth: true,
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const msg =
+          (body as { error?: string })?.error || `Innlogging feilet (${resp.status}).`;
+        throw new Error(msg);
+      }
+      const data = body as { sessionToken: string; user: AuthUser };
+      await applyAuth({ sessionToken: data.sessionToken, user: data.user });
+    },
+    [applyAuth],
+  );
+
+  const registerWithPassword = useCallback(
+    async (email: string, password: string) => {
+      const resp = await apiFetch('/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim(), password }),
+        skipAuth: true,
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const msg =
+          (body as { error?: string })?.error || `Registrering feilet (${resp.status}).`;
+        throw new Error(msg);
+      }
+      const data = body as { sessionToken: string; user: AuthUser };
+      await applyAuth({ sessionToken: data.sessionToken, user: data.user });
+    },
+    [applyAuth],
+  );
+
+  const continueAsGuest = useCallback(async () => {
+    await bootstrapAnonymous();
+  }, [bootstrapAnonymous]);
+
+  const signOut = useCallback(async () => {
+    try {
+      if (currentSessionToken) {
+        await apiFetch('/auth/logout', { method: 'POST' });
+      }
+    } catch {
+      // nettverk — vi nullstiller lokalt uansett
+    }
+    await applyAuth({ sessionToken: null, user: null });
+  }, [applyAuth]);
+
   const setServerUrl = useCallback((url: string) => {
     setServerUrlState(coerceChatServerUrl(url));
   }, []);
@@ -522,12 +602,31 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       user,
       sessionToken,
       openStravaConnect,
+      openStravaLogin,
       refreshUser,
+      signInWithPassword,
+      registerWithPassword,
+      continueAsGuest,
+      signOut,
       serverUrl,
       setServerUrl,
       resetToDefaultServerUrl,
     }),
-    [status, user, sessionToken, openStravaConnect, refreshUser, serverUrl, setServerUrl, resetToDefaultServerUrl],
+    [
+      status,
+      user,
+      sessionToken,
+      openStravaConnect,
+      openStravaLogin,
+      refreshUser,
+      signInWithPassword,
+      registerWithPassword,
+      continueAsGuest,
+      signOut,
+      serverUrl,
+      setServerUrl,
+      resetToDefaultServerUrl,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
@@ -545,6 +644,154 @@ export function useUserId(): string | null {
   return user?.id || null;
 }
 
+function AuthLoginScreen() {
+  const {
+    signInWithPassword,
+    registerWithPassword,
+    continueAsGuest,
+    openStravaLogin,
+    serverUrl,
+  } = useAuth();
+  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const onSubmit = async () => {
+    setError(null);
+    if (!email.trim() || !password) {
+      setError('Fyll inn e-post og passord.');
+      return;
+    }
+    setBusy(true);
+    try {
+      if (mode === 'login') {
+        await signInWithPassword(email, password);
+      } else {
+        await registerWithPassword(email, password);
+      }
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onGuest = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      await continueAsGuest();
+    } catch (e: any) {
+      setError(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <KeyboardAvoidingView
+      style={authStyles.loginRoot}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+    >
+      <ScrollView
+        contentContainerStyle={authStyles.loginScroll}
+        keyboardShouldPersistTaps="handled"
+      >
+        <Text style={authStyles.loginTitle}>Training Log</Text>
+        <Text style={authStyles.loginSubtitle}>
+          Logg inn med e-post og passord, med Strava, eller fortsett uten konto. Konto og økt lagres på
+          serveren (Redis) slik at innlogging fungerer også etter omstart og på Vercel.
+        </Text>
+        <Text style={authStyles.loginHint} selectable>
+          Server: {serverUrl}
+        </Text>
+
+        <Text style={authStyles.loginFieldLabel}>E-post</Text>
+        <TextInput
+          style={authStyles.loginInput}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType="email-address"
+          textContentType="username"
+          placeholder="deg@eksempel.no"
+          placeholderTextColor="#94a3b8"
+          value={email}
+          onChangeText={setEmail}
+          editable={!busy}
+        />
+
+        <Text style={authStyles.loginFieldLabel}>Passord</Text>
+        <TextInput
+          style={authStyles.loginInput}
+          secureTextEntry
+          textContentType={mode === 'login' ? 'password' : 'newPassword'}
+          placeholder={mode === 'register' ? 'Minst 8 tegn' : '••••••••'}
+          placeholderTextColor="#94a3b8"
+          value={password}
+          onChangeText={setPassword}
+          editable={!busy}
+        />
+
+        {error ? <Text style={authStyles.loginError}>{error}</Text> : null}
+
+        <Pressable
+          onPress={() => {
+            void openStravaLogin();
+          }}
+          disabled={busy}
+          style={({ pressed }) => [
+            authStyles.loginStravaBtn,
+            (busy || pressed) && { opacity: busy ? 0.6 : 0.92 },
+          ]}
+        >
+          <Text style={authStyles.loginStravaBtnText}>Logg inn med Strava</Text>
+        </Pressable>
+
+        <Pressable
+          onPress={onSubmit}
+          disabled={busy}
+          style={({ pressed }) => [
+            authStyles.loginPrimaryBtn,
+            (busy || pressed) && { opacity: busy ? 0.6 : 0.9 },
+          ]}
+        >
+          <Text style={authStyles.loginPrimaryBtnText}>
+            {busy ? '…' : mode === 'login' ? 'Logg inn' : 'Opprett konto'}
+          </Text>
+        </Pressable>
+
+        <Pressable
+          onPress={() => {
+            setMode((m) => (m === 'login' ? 'register' : 'login'));
+            setError(null);
+          }}
+          disabled={busy}
+          style={authStyles.loginLinkWrap}
+        >
+          <Text style={authStyles.loginLink}>
+            {mode === 'login' ? 'Har du ikke konto? Registrer deg' : 'Har du allerede konto? Logg inn'}
+          </Text>
+        </Pressable>
+
+        <View style={authStyles.loginDivider} />
+
+        <Pressable
+          onPress={onGuest}
+          disabled={busy}
+          style={({ pressed }) => [
+            authStyles.loginSecondaryBtn,
+            pressed && { opacity: 0.9 },
+          ]}
+        >
+          <Text style={authStyles.loginSecondaryBtnText}>Fortsett uten konto (anonym økt)</Text>
+        </Pressable>
+      </ScrollView>
+    </KeyboardAvoidingView>
+  );
+}
+
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const { status } = useAuth();
   if (status === 'loading') {
@@ -553,6 +800,9 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
         <ActivityIndicator size="large" color="#7A3C4A" />
       </View>
     );
+  }
+  if (status === 'signedOut') {
+    return <AuthLoginScreen />;
   }
   return <>{children}</>;
 }
@@ -563,5 +813,108 @@ const authStyles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: '#fff',
+  },
+  loginRoot: {
+    flex: 1,
+    backgroundColor: '#fff',
+  },
+  loginScroll: {
+    flexGrow: 1,
+    paddingHorizontal: 24,
+    paddingTop: 48,
+    paddingBottom: 32,
+    maxWidth: 480,
+    width: '100%',
+    alignSelf: 'center',
+  },
+  loginTitle: {
+    fontSize: 28,
+    fontWeight: '800',
+    color: '#0f172a',
+    marginBottom: 8,
+  },
+  loginSubtitle: {
+    fontSize: 15,
+    lineHeight: 22,
+    color: '#475569',
+    marginBottom: 8,
+  },
+  loginHint: {
+    fontSize: 12,
+    color: '#94a3b8',
+    marginBottom: 20,
+  },
+  loginFieldLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#334155',
+    marginBottom: 6,
+  },
+  loginInput: {
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: Platform.OS === 'ios' ? 12 : 10,
+    fontSize: 16,
+    color: '#0f172a',
+    marginBottom: 14,
+    backgroundColor: '#f8fafc',
+  },
+  loginError: {
+    color: '#b91c1c',
+    fontSize: 14,
+    marginBottom: 12,
+  },
+  loginStravaBtn: {
+    backgroundColor: '#fc4c02',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  loginStravaBtnText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  loginPrimaryBtn: {
+    backgroundColor: '#7A3C4A',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  loginPrimaryBtnText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  loginLinkWrap: {
+    marginTop: 16,
+    alignItems: 'center',
+  },
+  loginLink: {
+    color: '#7A3C4A',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  loginDivider: {
+    height: 1,
+    backgroundColor: '#e2e8f0',
+    marginVertical: 24,
+  },
+  loginSecondaryBtn: {
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    backgroundColor: '#fff',
+  },
+  loginSecondaryBtnText: {
+    color: '#475569',
+    fontSize: 15,
+    fontWeight: '600',
   },
 });

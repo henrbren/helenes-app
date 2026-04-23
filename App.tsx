@@ -3629,7 +3629,7 @@ const ChatTab = React.forwardRef<
 ) {
   const userId = useUserId();
   const auth = useAuth();
-  const { serverUrl, setServerUrl, resetToDefaultServerUrl, user: authUser } = auth;
+  const { serverUrl, setServerUrl, resetToDefaultServerUrl, user: authUser, signOut } = auth;
   const chatApiBase = serverUrl;
   const chatStorageKey = userKey(CHAT_STORAGE_KEY, userId);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -4037,8 +4037,9 @@ const ChatTab = React.forwardRef<
             <Text style={styles.fieldLabel}>Denne enheten</Text>
             <View style={{ gap: 4 }}>
               <Text style={styles.muted}>
-                Appen bruker en anonym økt på denne enheten (ingen epost eller passord). Data knyttes
-                til denne økten på serveren.
+                {authUser?.hasPassword || authUser?.email
+                  ? `Innlogget med e-post: ${authUser.email || '(ukjent)'}. Økt og brukerdata ligger på serveren (Redis).`
+                  : 'Du bruker en anonym økt (ingen e-post eller passord). Data knyttes til denne økten på serveren.'}
               </Text>
               {authUser?.stravaAthleteId ? (
                 <Text style={styles.muted}>
@@ -4049,6 +4050,29 @@ const ChatTab = React.forwardRef<
                 <Text style={styles.muted}>Ingen Strava-konto koblet til ennå.</Text>
               )}
             </View>
+            <Pressable
+              onPress={() => {
+                void Haptics.selectionAsync();
+                Alert.alert(
+                  'Logge ut?',
+                  'Du må logge inn på nytt eller velge anonym økt for å bruke appen igjen.',
+                  [
+                    { text: 'Avbryt', style: 'cancel' },
+                    {
+                      text: 'Logg ut',
+                      style: 'destructive',
+                      onPress: () => {
+                        void signOut();
+                        onSettingsModalClose();
+                      },
+                    },
+                  ],
+                );
+              }}
+              style={[styles.dangerButton, { marginTop: 12 }]}
+            >
+              <Text style={styles.dangerButtonText}>Logg ut</Text>
+            </Pressable>
 
             <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Strava</Text>
             <Text style={styles.muted}>

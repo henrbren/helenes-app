@@ -166,6 +166,22 @@ function appRootAfterStravaOAuth(statePayload) {
 // ---- Auth routes -----------------------------------------------------------
 app.use(createAuthRouter({ stravaRedirectUri }));
 
+// ---- Strava login (ingen sesjon – finn/opprette bruker via athleteId) -------
+app.get('/strava/login', async (req, res) => {
+  try {
+    const redirectUri = stravaRedirectUri(req);
+    const state = await createOAuthState({
+      intent: 'login',
+      redirectUri,
+      returnBaseUrl: selfBaseUrl(req),
+    });
+    const url = buildAuthorizeUrl({ redirectUri, state });
+    res.redirect(url);
+  } catch (err) {
+    res.status(500).json({ error: err?.message || 'Kunne ikke bygge authorize-url.' });
+  }
+});
+
 // ---- Strava connect (krever innlogget bruker) ------------------------------
 app.get('/strava/connect', requireAuth, async (req, res) => {
   try {
