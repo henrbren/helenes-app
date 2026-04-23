@@ -726,4 +726,8 @@ app.post('/chat/session-feedback', async (req, res) => {
   }
 });
 
+app.use((req, res) => {
+  res.status(404).type('application/json').json({ error: 'Not found', path: req.path || req.url });
+});
+
 export default app;

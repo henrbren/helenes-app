@@ -62,26 +62,46 @@ const tabIcons: Record<Tab, string> = {
 
 const SERVER_PORT = 8787;
 
+/** Metro, Expo dev client, Vite preview, osv. — aldri bruk dette som chat-API (backend er :8787 eller Vercel). */
+const KNOWN_DEV_BUNDLER_PORTS = new Set(['8081', '8082', '19000', '19001', '19002', '19006', '4173']);
+
+function isLikelyBundlerOrStaticDevUrl(url: string): boolean {
+  try {
+    const u = new URL(url.trim());
+    const p = u.port || (u.protocol === 'https:' ? '443' : '80');
+    return KNOWN_DEV_BUNDLER_PORTS.has(p);
+  } catch {
+    return false;
+  }
+}
+
+/** Erstatter feilaktig lagret «Metro»-URL med standard API-adresse. */
+function coerceChatServerUrl(url: string): string {
+  return isLikelyBundlerOrStaticDevUrl(url) ? resolveDefaultServerUrl() : normalizeApiBase(url);
+}
+
 /** Normaliser base-URL (trim, ingen trailing slash). */
 function normalizeApiBase(url: string): string {
   return url.trim().replace(/\/$/, '');
 }
 
 /**
- * Bygger URL til fetch. På prod-web bruker vi relative stier (/chat) når base er tom eller lik
- * sidens origin — da unngår vi CORS/host-mismatch som gir «Failed to fetch».
+ * Bygger URL til fetch. På https-sider: aldri kall http:// (mixed content → «Failed to fetch»).
+ * Bruk relative stier mot samme host når base er tom, lik origin, eller ugyldig http mot https-side.
  */
 function joinApiUrl(base: string, pathWithQuery: string): string {
   const path = pathWithQuery.startsWith('/') ? pathWithQuery : `/${pathWithQuery}`;
-  if (
-    Platform.OS === 'web' &&
-    !__DEV__ &&
-    typeof window !== 'undefined' &&
-    window.location?.origin
-  ) {
+  if (useSameOriginApiOnWeb()) {
+    return path;
+  }
+  if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location?.origin) {
     const origin = normalizeApiBase(window.location.origin);
     const b = base.trim();
-    if (!b || normalizeApiBase(b) === origin) {
+    const pageHttps = window.location.protocol === 'https:';
+    if (pageHttps && (!b || /^http:\/\//i.test(b) || normalizeApiBase(b) === origin)) {
+      return path;
+    }
+    if (!__DEV__ && (!b || normalizeApiBase(b) === origin)) {
       return path;
     }
   }
@@ -92,15 +112,42 @@ function joinApiUrl(base: string, pathWithQuery: string): string {
 /** Absolutt https-URL for Linking.openURL (web trenger full URL, ikke /strava/... alene). */
 function absoluteApiUrl(base: string, pathWithQuery: string): string {
   const path = pathWithQuery.startsWith('/') ? pathWithQuery : `/${pathWithQuery}`;
+  if (useSameOriginApiOnWeb() && typeof window !== 'undefined') {
+    return `${normalizeApiBase(window.location.origin)}${path}`;
+  }
   if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location?.origin) {
     const origin = normalizeApiBase(window.location.origin);
     const b = base.trim();
+    const pageHttps = window.location.protocol === 'https:';
+    if (pageHttps && (!b || /^http:\/\//i.test(b) || normalizeApiBase(b) === origin)) {
+      return `${origin}${path}`;
+    }
     if (!b || normalizeApiBase(b) === origin) {
       return `${origin}${path}`;
     }
   }
   const prefix = base.trim() ? normalizeApiBase(base) : '';
   return prefix ? `${prefix}${path}` : path;
+}
+
+/** Leser response body som tekst og parser JSON — gir tydelig feil ved HTML/feilside. */
+async function parseFetchJsonBody(resp: Response): Promise<unknown> {
+  const textBody = await resp.text();
+  const trimmed = textBody.trim();
+  if (!trimmed) {
+    if (!resp.ok) throw new Error(`Tomt svar fra server (HTTP ${resp.status}).`);
+    return {};
+  }
+  try {
+    return JSON.parse(trimmed.replace(/^\uFEFF/, ''));
+  } catch {
+    const isHtml = /<\s*!DOCTYPE|<\s*html[\s>]/i.test(textBody);
+    throw new Error(
+      isHtml
+        ? `Fikk HTML i stedet for JSON (HTTP ${resp.status}). Ofte Vercel-feil, feil rute, eller at API ikke kjørte.`
+        : `Ugyldig JSON (HTTP ${resp.status}): ${trimmed.slice(0, 160)}`,
+    );
+  }
 }
 
 /**
@@ -112,9 +159,54 @@ function apiBaseFromEnv(): string | null {
   return v ? normalizeApiBase(v) : null;
 }
 
+/** Standard API fra app.json (også under lokal `expo start`). Overstyr med EXPO_PUBLIC_API_URL om nødvendig. */
+function apiBaseFromAppExtra(): string | null {
+  const u = (Constants.expoConfig?.extra as { apiUrl?: string } | undefined)?.apiUrl?.trim();
+  return u ? normalizeApiBase(u) : null;
+}
+
+/**
+ * Produksjons-web på HTTPS: API ligger på samme host som siden (Vercel rewrites), med mindre
+ * EXPO_PUBLIC_API_URL bevisst peker til en annen host (delt frontend/API).
+ * Da bruker vi relative URL-er og unngår cross-origin «Failed to fetch» ved feil lagret host
+ * eller utdatert byggesk variabel.
+ */
+function useSameOriginApiOnWeb(): boolean {
+  if (Platform.OS !== 'web' || typeof window === 'undefined' || !window.location?.origin) {
+    return false;
+  }
+  if (__DEV__ || window.location.protocol !== 'https:') {
+    return false;
+  }
+  const origin = normalizeApiBase(window.location.origin);
+  const fromEnv = apiBaseFromEnv();
+  if (fromEnv && normalizeApiBase(fromEnv) !== origin) {
+    return false;
+  }
+  return true;
+}
+
 function resolveDefaultServerUrl(): string {
+  // Faktisk åpnet HTTPS-origin slår utdatert extra/env på Vercel/preview (unngår feil API-host).
+  if (
+    Platform.OS === 'web' &&
+    typeof window !== 'undefined' &&
+    window.location?.origin &&
+    !__DEV__ &&
+    window.location.protocol === 'https:'
+  ) {
+    const origin = normalizeApiBase(window.location.origin);
+    const fromEnv = apiBaseFromEnv();
+    if (fromEnv && normalizeApiBase(fromEnv) !== origin) {
+      return normalizeApiBase(fromEnv);
+    }
+    return origin;
+  }
+
   const fromEnv = apiBaseFromEnv();
   if (fromEnv) return fromEnv;
+  const fromExtra = apiBaseFromAppExtra();
+  if (fromExtra) return fromExtra;
   // Statisk web-export (f.eks. Vercel): API ligger på samme host som siden via rewrites.
   // Uten dette faller vi tilbake til localhost:8787 og får «Failed to fetch» i nettleseren.
   if (
@@ -123,7 +215,16 @@ function resolveDefaultServerUrl(): string {
     window.location?.origin &&
     !__DEV__
   ) {
-    return normalizeApiBase(window.location.origin);
+    const { protocol, hostname, port } = window.location;
+    const effectivePort = port || (protocol === 'https:' ? '443' : '80');
+    const loopback = hostname === 'localhost' || hostname === '127.0.0.1';
+    const usePageAsApiBase =
+      protocol === 'https:' ||
+      !loopback ||
+      effectivePort === String(SERVER_PORT);
+    if (usePageAsApiBase) {
+      return normalizeApiBase(window.location.origin);
+    }
   }
   const hostUri =
     (Constants.expoConfig as any)?.hostUri ||
@@ -566,11 +667,16 @@ function describeStravaActivityShortLine(a: StravaActivity): string {
 async function getServerUrl(): Promise<string> {
   const fromEnv = apiBaseFromEnv();
   if (fromEnv) return fromEnv;
+  const fromExtra = apiBaseFromAppExtra();
+  if (fromExtra) return fromExtra;
   try {
     const raw = await AsyncStorage.getItem(CHAT_CONFIG_KEY);
     if (raw) {
       const cfg = JSON.parse(raw) as { serverUrl?: string };
       if (cfg?.serverUrl) {
+        if (isLikelyBundlerOrStaticDevUrl(cfg.serverUrl)) {
+          return resolveDefaultServerUrl();
+        }
         const savedIsLocalhost = /(localhost|127\.0\.0\.1)/.test(cfg.serverUrl);
         const detected = resolveDefaultServerUrl();
         const detectedIsLan = !/(localhost|127\.0\.0\.1)/.test(detected);
@@ -3496,7 +3602,15 @@ const ChatTab = React.forwardRef<
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [isSending, setIsSending] = useState(false);
-  const [serverUrl, setServerUrl] = useState(resolveDefaultServerUrl);
+  const [serverUrl, setServerUrl] = useState(() => coerceChatServerUrl(resolveDefaultServerUrl()));
+  const chatApiBase = useMemo(() => coerceChatServerUrl(serverUrl), [serverUrl]);
+
+  useEffect(() => {
+    if (chatApiBase !== serverUrl) {
+      setServerUrl(chatApiBase);
+    }
+  }, [serverUrl, chatApiBase]);
+
   const listRef = useRef<FlatList<ChatListItem> | null>(null);
   // Track whether the user is near the newest message. On an inverted list
   // offset 0 is the visual bottom (newest). We only auto-scroll when the user
@@ -3536,22 +3650,26 @@ const ChatTab = React.forwardRef<
         if (rawCfg) {
           const cfg = JSON.parse(rawCfg) as { serverUrl?: string };
           if (cfg?.serverUrl) {
-            // HTTPS-side som https://*.vercel.app kan ikke kalle http:// (mixed content) → Failed to fetch.
-            const pageHttps =
-              Platform.OS === 'web' &&
-              !__DEV__ &&
-              typeof window !== 'undefined' &&
-              window.location.protocol === 'https:';
-            if (pageHttps && /^http:\/\//i.test(cfg.serverUrl)) {
-              setServerUrl(normalizeApiBase(window.location.origin));
+            if (isLikelyBundlerOrStaticDevUrl(cfg.serverUrl)) {
+              setServerUrl(resolveDefaultServerUrl());
             } else {
-              const savedIsLocalhost = /(localhost|127\.0\.0\.1)/.test(cfg.serverUrl);
-              const detected = resolveDefaultServerUrl();
-              const detectedIsLan = !/(localhost|127\.0\.0\.1)/.test(detected);
-              // If we're on a physical device (auto-detected URL is on the LAN), always
-              // prefer the freshly detected LAN URL — saved URL may point to localhost or
-              // a stale IP from a previous dev session.
-              setServerUrl(detectedIsLan ? detected : savedIsLocalhost ? detected : cfg.serverUrl);
+              // HTTPS-side som https://*.vercel.app kan ikke kalle http:// (mixed content) → Failed to fetch.
+              const pageHttps =
+                Platform.OS === 'web' &&
+                !__DEV__ &&
+                typeof window !== 'undefined' &&
+                window.location.protocol === 'https:';
+              if (pageHttps && /^http:\/\//i.test(cfg.serverUrl)) {
+                setServerUrl(normalizeApiBase(window.location.origin));
+              } else {
+                const savedIsLocalhost = /(localhost|127\.0\.0\.1)/.test(cfg.serverUrl);
+                const detected = resolveDefaultServerUrl();
+                const detectedIsLan = !/(localhost|127\.0\.0\.1)/.test(detected);
+                // If we're on a physical device (auto-detected URL is on the LAN), always
+                // prefer the freshly detected LAN URL — saved URL may point to localhost or
+                // a stale IP from a previous dev session.
+                setServerUrl(detectedIsLan ? detected : savedIsLocalhost ? detected : cfg.serverUrl);
+              }
             }
           }
         }
@@ -3603,9 +3721,12 @@ const ChatTab = React.forwardRef<
           const timeoutId = setTimeout(() => controller.abort(), 45000);
           let resp: Response;
           try {
-            resp = await fetch(joinApiUrl(serverUrl, '/chat/session-feedback'), {
+            resp = await fetch(joinApiUrl(chatApiBase, '/chat/session-feedback'), {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+              },
               body: JSON.stringify({
                 session: sessionDescription,
                 history: historyDescription || '',
@@ -3616,12 +3737,7 @@ const ChatTab = React.forwardRef<
           } finally {
             clearTimeout(timeoutId);
           }
-          let raw: unknown;
-          try {
-            raw = await resp.json();
-          } catch {
-            throw new Error('Serveren svarte med ugyldig data.');
-          }
+          const raw = await parseFetchJsonBody(resp);
           if (!resp.ok) {
             const body = raw as { error?: string };
             throw new Error(body?.error || `Server feilet (${resp.status}).`);
@@ -3648,7 +3764,7 @@ const ChatTab = React.forwardRef<
         }
       },
     }),
-    [serverUrl],
+    [chatApiBase],
   );
 
   async function send() {
@@ -3683,7 +3799,7 @@ const ChatTab = React.forwardRef<
             .filter((m) => (m.text ?? '').trim().length > 0)
             .map((m) => ({
               role: m.role,
-              content: m.text,
+              content: typeof m.text === 'string' ? m.text : String(m.text ?? ''),
             })),
         ],
       };
@@ -3692,9 +3808,12 @@ const ChatTab = React.forwardRef<
       const timeoutId = setTimeout(() => controller.abort(), 45000);
       let resp: Response;
       try {
-        resp = await fetch(joinApiUrl(serverUrl, '/chat'), {
+        resp = await fetch(joinApiUrl(chatApiBase, '/chat'), {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
           body: JSON.stringify(payload),
           signal: controller.signal,
         });
@@ -3702,18 +3821,16 @@ const ChatTab = React.forwardRef<
         clearTimeout(timeoutId);
       }
 
-      let raw: unknown;
-      try {
-        raw = await resp.json();
-      } catch {
-        throw new Error('Serveren svarte med ugyldig data.');
-      }
+      const raw = await parseFetchJsonBody(resp);
 
       if (!resp.ok) {
         const body = raw as { error?: string };
         throw new Error(body?.error || `Server feilet (${resp.status}). Sjekk at chat-serveren kjører.`);
       }
 
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new Error('Uventet svarformat fra server (forventet JSON-objekt).');
+      }
       const data = raw as { text?: string; toolResult?: ChatToolResult };
       const tr = data?.toolResult;
       let replyText = (data?.text || '').trim();
@@ -3723,6 +3840,9 @@ const ChatTab = React.forwardRef<
       }
       if (!replyText && tr?.kind === 'tool_card') {
         replyText = 'Her er et kort svar (se boksen under).';
+      }
+      if (!replyText && !tr) {
+        throw new Error('Tomt svar fra chat (JSON OK men ingen tekst eller verktøydata).');
       }
 
       const assistantMsg: ChatMessage = {
@@ -3740,7 +3860,7 @@ const ChatTab = React.forwardRef<
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       const hint =
         Platform.OS === 'web'
-          ? 'På web: prøv å laste siden på nytt. Sjekk at https://…/health svarer med {"ok":true}.'
+          ? 'På https-sider kan ikke nettleseren kalle http:// (localhost/Mac) — da blir det «Failed to fetch». Bruk samme domene som siden eller sjekk /health.'
           : 'På iPhone: Chat → Innstillinger → sett server-URL til https://ditt-prosjekt.vercel.app (eller kjør backend på Mac og bruk Mac-ens IP:8787 på samme Wi‑Fi).';
       setMessages((prev) => [
         {
@@ -3932,8 +4052,11 @@ const ChatTab = React.forwardRef<
           <ScrollView contentContainerStyle={styles.modalContent} keyboardShouldPersistTaps="handled">
             <Text style={styles.fieldLabel}>Server-adresse</Text>
             <Text style={styles.muted}>
-              På iOS Simulator kan du bruke <Text style={{ fontWeight: '800' }}>http://localhost:8787</Text>. På fysisk iPhone må dette være
-              IP-adressen til Mac-en din (samme Wi‑Fi), f.eks. <Text style={{ fontWeight: '800' }}>http://192.168.1.23:8787</Text>.
+              Standard er API fra app-konfig (Vercel) eller <Text style={{ fontWeight: '800' }}>http://localhost:8787</Text> når du kjører{' '}
+              <Text style={{ fontWeight: '800' }}>backend</Text> lokalt. <Text style={{ fontWeight: '800' }}>Ikke</Text> bruk port{' '}
+              <Text style={{ fontWeight: '800' }}>8081</Text> — det er bare Expo/Metro (JavaScript), ikke chat-serveren. iOS Simulator:{' '}
+              <Text style={{ fontWeight: '800' }}>http://localhost:8787</Text>. Fysisk iPhone (samme Wi‑Fi): Mac-ens IP, f.eks.{' '}
+              <Text style={{ fontWeight: '800' }}>http://192.168.1.23:8787</Text>.
             </Text>
             <TextInput value={serverUrl} onChangeText={setServerUrl} autoCapitalize="none" autoCorrect={false} style={styles.input} />
 
@@ -3941,7 +4064,7 @@ const ChatTab = React.forwardRef<
               <Pressable
                 onPress={() => {
                   void Haptics.selectionAsync();
-                  setServerUrl(resolveDefaultServerUrl());
+                  setServerUrl(coerceChatServerUrl(resolveDefaultServerUrl()));
                 }}
                 style={[styles.secondaryButtonFull, { flex: 1 }]}
               >
@@ -3951,16 +4074,16 @@ const ChatTab = React.forwardRef<
                 onPress={async () => {
                   void Haptics.selectionAsync();
                   try {
-                    const resp = await fetch(joinApiUrl(serverUrl, '/health'));
+                    const resp = await fetch(joinApiUrl(chatApiBase, '/health'));
                     if (resp.ok) {
-                      Alert.alert('Tilkoblet', `Serveren svarer på ${serverUrl}.`);
+                      Alert.alert('Tilkoblet', `Serveren svarer på ${chatApiBase}.`);
                     } else {
                       Alert.alert('Feil', `Serveren svarte med status ${resp.status}.`);
                     }
                   } catch (e: any) {
                     Alert.alert(
                       'Ingen kontakt',
-                      `Kunne ikke nå ${serverUrl}.\n\nSjekk at serveren kjører: \n\ncd backend && npm run dev\n\nFeil: ${String(e?.message || e)}`,
+                      `Kunne ikke nå ${chatApiBase}.\n\nSjekk at serveren kjører: \n\ncd backend && npm run dev\n\nFeil: ${String(e?.message || e)}`,
                     );
                   }
                 }}
@@ -3981,7 +4104,7 @@ const ChatTab = React.forwardRef<
                   onPress={async () => {
                     void Haptics.selectionAsync();
                     try {
-                      await Linking.openURL(absoluteApiUrl(serverUrl, '/strava/connect'));
+                      await Linking.openURL(absoluteApiUrl(chatApiBase, '/strava/connect'));
                     } catch (e: any) {
                       Alert.alert('Kunne ikke åpne Strava', String(e?.message || e));
                     }

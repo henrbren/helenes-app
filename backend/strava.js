@@ -25,6 +25,15 @@ const STRAVA_OAUTH_URL = 'https://www.strava.com/oauth/token';
 const STRAVA_AUTHORIZE_URL = 'https://www.strava.com/oauth/authorize';
 const STRAVA_API_BASE = 'https://www.strava.com/api/v3';
 export const DEFAULT_SCOPE = 'read,activity:read_all,profile:read_all';
+
+/** Først standard STRAVA_*, så f.eks. Vercel-camelCase (stravaClientId, …). */
+function stravaEnv(...keys) {
+  for (const k of keys) {
+    const v = process.env[k];
+    if (v != null && String(v).trim() !== '') return v;
+  }
+  return undefined;
+}
 // Refresh a little before actual expiry so we don't race the clock.
 const REFRESH_LEEWAY_SECONDS = 120;
 
@@ -65,9 +74,9 @@ async function loadInitialState() {
     return tokenState;
   }
 
-  const accessToken = process.env.STRAVA_ACCESS_TOKEN;
-  const refreshToken = process.env.STRAVA_REFRESH_TOKEN;
-  const expiresAt = Number(process.env.STRAVA_EXPIRES_AT || 0);
+  const accessToken = stravaEnv('STRAVA_ACCESS_TOKEN', 'stravaAccessToken');
+  const refreshToken = stravaEnv('STRAVA_REFRESH_TOKEN', 'stravaUpdateToken');
+  const expiresAt = Number(stravaEnv('STRAVA_EXPIRES_AT', 'stravaExpiresAt') || 0);
 
   if (!accessToken || !refreshToken) {
     throw new Error(
@@ -84,8 +93,8 @@ async function loadInitialState() {
 }
 
 async function refreshAccessToken() {
-  const clientId = process.env.STRAVA_CLIENT_ID;
-  const clientSecret = process.env.STRAVA_CLIENT_SECRET;
+  const clientId = stravaEnv('STRAVA_CLIENT_ID', 'stravaClientId');
+  const clientSecret = stravaEnv('STRAVA_CLIENT_SECRET', 'stravaClientSecret');
   if (!clientId || !clientSecret) {
     throw new Error('Missing STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET in backend/.env');
   }
@@ -158,7 +167,7 @@ async function stravaGet(pathname, query) {
 }
 
 export function buildAuthorizeUrl({ redirectUri, scope = DEFAULT_SCOPE }) {
-  const clientId = process.env.STRAVA_CLIENT_ID;
+  const clientId = stravaEnv('STRAVA_CLIENT_ID', 'stravaClientId');
   if (!clientId) throw new Error('Missing STRAVA_CLIENT_ID');
   const url = new URL(STRAVA_AUTHORIZE_URL);
   url.searchParams.set('client_id', clientId);
@@ -181,8 +190,8 @@ export function hasActivityListScope(scopeString) {
 }
 
 export async function exchangeCodeForTokens(code, redirectUri, grantedScope = '') {
-  const clientId = process.env.STRAVA_CLIENT_ID;
-  const clientSecret = process.env.STRAVA_CLIENT_SECRET;
+  const clientId = stravaEnv('STRAVA_CLIENT_ID', 'stravaClientId');
+  const clientSecret = stravaEnv('STRAVA_CLIENT_SECRET', 'stravaClientSecret');
   if (!clientId || !clientSecret) {
     throw new Error('Missing STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET');
   }

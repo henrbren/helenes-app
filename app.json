@@ -28,6 +28,9 @@
     },
     "plugins": [
       "@react-native-community/datetimepicker"
-    ]
+    ],
+    "extra": {
+      "apiUrl": "https://helenes-app.vercel.app"
+    }
   }
 }
