@@ -53,16 +53,20 @@ const STRAVA_STATS_CACHE_KEY = 'training-log-ios:strava-stats:v1';
 const STRAVA_BEST_EFFORTS_CACHE_KEY = 'training-log-ios:strava-best-efforts:v1';
 const STRAVA_CONNECTED_KEY = 'training-log-ios:strava-connected:v1';
 const RUNNING_PROGRAMS_KEY = 'training-log-ios:running-programs:v1';
+const STRENGTH_PROGRAMS_KEY = 'training-log-ios:strength-programs:v1';
 const COMPETITION_FOLLOWUP_KEY = 'training-log-ios:competition-followup-sent:v1';
 
-const tabs = ['Chat', 'Løpeprogram', 'Økter', 'Statistikk'] as const;
+const tabs = ['Chat', 'Program', 'Økter', 'Statistikk'] as const;
 type Tab = (typeof tabs)[number];
+
+/** Underfane inne i hovedfansen «Program» (løpe- vs. styrkesjekkliste). */
+type ProgramSubTab = 'running' | 'strength';
 
 const tabIcons: Record<Tab, string> = {
   Chat: '💬',
+  Program: '📋',
   Økter: '➕',
   Statistikk: '📊',
-  Løpeprogram: '🗓️',
 };
 
 const SERVER_PORT = 8787;
@@ -311,7 +315,47 @@ type RunningProgramPayload = {
   }>;
 };
 
-type ChatToolResult = ToolCard | RunningProgramPayload;
+type StrengthProgramPayload = {
+  kind: 'strength_program';
+  title: string;
+  goalSummary: string;
+  weeks: number;
+  sessions: Array<{
+    week: number;
+    dayLabel: string;
+    title: string;
+    description: string;
+    date?: string;
+    workoutType?: string;
+  }>;
+};
+
+type ChatToolResult = ToolCard | RunningProgramPayload | StrengthProgramPayload;
+
+/** Belastning: vekt (kg) eller varighet (minutter), f.eks. planke. */
+type StrengthLoadKind = 'kg' | 'time';
+
+/** Lagret styrkeøvelsesett for program-sjekkliste (manuell redigering). */
+type StrengthExerciseSetSaved = {
+  reps: string;
+  /** Mangler i eldre lagring: da tolkes vekt som kg. */
+  loadKind?: StrengthLoadKind;
+  /** Når loadKind === 'kg' eller udefinert (legacy). */
+  weightKg?: string;
+  /** Når loadKind === 'time' (heltall, minutter). */
+  timeMinutes?: string;
+  /** Krysset av når dette settet er utført (sjekkliste). */
+  setDone?: boolean;
+  /** Logget uavhengig av plan; vises/ redigeres i sjekklisten hvis satt. */
+  actualReps?: string;
+  actualWeightKg?: string;
+  actualTimeMinutes?: string;
+};
+
+type StrengthExerciseSaved = {
+  name: string;
+  sets: StrengthExerciseSetSaved[];
+};
 
 type SavedProgramItem = {
   id: string;
@@ -324,6 +368,8 @@ type SavedProgramItem = {
   date?: string;
   /** Løpeøkttype (samme verdier som manuell logging) */
   workoutType?: string;
+  /** Styrke: øvelser med sett, reps og belastning (kg eller tid). */
+  strengthExercises?: StrengthExerciseSaved[];
 };
 
 type SavedRunningProgram = {
@@ -348,8 +394,10 @@ type ChatMessage = {
   createdAt: number;
   toolCard?: ToolCard;
   runningProgram?: RunningProgramPayload;
-  /** Satt når brukeren har lagret programmet under Løpeprogram (persistert med chat). */
+  /** Satt når brukeren har lagret løpeprogrammet fra chat (persistert med chat). */
   runningProgramSaved?: boolean;
+  strengthProgram?: StrengthProgramPayload;
+  strengthProgramSaved?: boolean;
 };
 
 type ChatListItem =
@@ -388,6 +436,102 @@ function runWorkoutTypeLabel(value: string | undefined): string {
   if (!value) return '';
   const o = runWorkoutTypeOptions.find((x) => x.value === value);
   return o?.label ?? value;
+}
+
+function strengthWorkoutTypeLabel(value: string | undefined): string {
+  if (!value) return '';
+  const o = strengthWorkoutTypeOptions.find((x) => x.value === value);
+  return o?.label ?? value;
+}
+
+/** Avkryssing når setDone mangler (eldre data): følger hele økten. */
+function strengthSetEffectiveDone(s: StrengthExerciseSetSaved, legacyItemDone: boolean): boolean {
+  if (s.setDone === true) return true;
+  if (s.setDone === false) return false;
+  return legacyItemDone;
+}
+
+function strengthSetDisplayReps(s: StrengthExerciseSetSaved): string {
+  if (s.actualReps != null && s.actualReps !== '') return s.actualReps;
+  return s.reps || '';
+}
+
+function strengthSetDisplayLoad(
+  s: StrengthExerciseSetSaved,
+): { kind: 'time' | 'kg'; text: string } {
+  const isTime = s.loadKind === 'time' || (!!s.timeMinutes?.trim() && s.loadKind !== 'kg');
+  if (isTime) {
+    const t =
+      s.actualTimeMinutes != null && s.actualTimeMinutes !== ''
+        ? s.actualTimeMinutes
+        : s.timeMinutes || '';
+    return { kind: 'time', text: t };
+  }
+  const w =
+    s.actualWeightKg != null && s.actualWeightKg !== '' ? s.actualWeightKg : s.weightKg || '';
+  return { kind: 'kg', text: w };
+}
+
+/** Styrkeøkt regnes som fullført når alle sett (med data) er utført. */
+function strengthChecklistItemDone(item: SavedProgramItem): boolean {
+  const exs = item.strengthExercises;
+  if (!exs?.length) return item.done;
+  let setCount = 0;
+  for (const e of exs) {
+    for (const _s of e.sets || []) {
+      setCount++;
+    }
+  }
+  if (setCount === 0) return item.done;
+  for (const e of exs) {
+    for (const s of e.sets || []) {
+      if (!strengthSetEffectiveDone(s, item.done)) return false;
+    }
+  }
+  return true;
+}
+
+function mergeStrengthSetProgress(
+  prev: StrengthExerciseSetSaved | undefined,
+  next: StrengthExerciseSetSaved,
+): StrengthExerciseSetSaved {
+  if (!prev) return next;
+  return {
+    ...next,
+    setDone: prev.setDone,
+    actualReps: prev.actualReps,
+    actualWeightKg: prev.actualWeightKg,
+    actualTimeMinutes: prev.actualTimeMinutes,
+  };
+}
+
+function mergeStrengthExercisesWithProgress(
+  previous: StrengthExerciseSaved[] | undefined,
+  next: StrengthExerciseSaved[],
+): StrengthExerciseSaved[] {
+  if (!previous?.length) return next;
+  return next.map((ex, exI) => {
+    const pEx = previous[exI];
+    if (!pEx) return ex;
+    return {
+      ...ex,
+      sets: (ex.sets || []).map((s, sI) => mergeStrengthSetProgress(pEx.sets?.[sI], s)),
+    };
+  });
+}
+
+function applyStrengthSetLogPatch(
+  current: StrengthExerciseSetSaved,
+  patch: Partial<Pick<StrengthExerciseSetSaved, 'setDone' | 'actualReps' | 'actualWeightKg' | 'actualTimeMinutes'>>,
+): StrengthExerciseSetSaved {
+  const n: StrengthExerciseSetSaved = { ...current, ...patch };
+  for (const key of ['actualReps', 'actualWeightKg', 'actualTimeMinutes'] as const) {
+    const v = n[key];
+    if (v === undefined || (typeof v === 'string' && v.trim() === '')) {
+      delete (n as unknown as Record<string, unknown>)[key];
+    }
+  }
+  return n;
 }
 
 function isStrengthSession(session: Pick<Session, 'workoutType'>) {
@@ -2559,6 +2703,216 @@ function newProgramLineKey() {
   return `ln-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+function newStrengthExerciseFormKey() {
+  return `se-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+type StrengthSetLineForm = {
+  reps: string;
+  loadKind: StrengthLoadKind;
+  kg: string;
+  timeMinutes: string;
+};
+
+type StrengthExerciseForm = {
+  key: string;
+  name: string;
+  /** Antall sett: like mange rader med reps + kg. */
+  setCountStr: string;
+  setLines: StrengthSetLineForm[];
+};
+
+function emptyStrengthExercise(): StrengthExerciseForm {
+  return {
+    key: newStrengthExerciseFormKey(),
+    name: '',
+    setCountStr: '1',
+    setLines: [{ reps: '', loadKind: 'kg', kg: '', timeMinutes: '' }],
+  };
+}
+
+const MAX_STRENGTH_SET_LINES = 20;
+/** Maks minutter i hjulvelger for tid-belastning (plank e.l.). */
+const STRENGTH_TIME_MAX_MIN = 120;
+/** Maks antall reps i hjulvelger (1…STRENGTH_REPS_MAX). */
+const STRENGTH_REPS_MAX = 200;
+/** Hjulvelger for kg: 0 … STRENGTH_KG_MAX (hele kilo). */
+const STRENGTH_KG_MAX = 500;
+const STRENGTH_KG_COUNT = STRENGTH_KG_MAX + 1;
+
+function savedStrengthSetToFormLine(s: StrengthExerciseSetSaved): StrengthSetLineForm {
+  const timeMin = s.timeMinutes?.trim() ?? '';
+  const w = s.weightKg?.trim() ?? '';
+  if (s.loadKind === 'time' || (s.loadKind == null && timeMin)) {
+    return {
+      reps: s.reps || '',
+      loadKind: 'time',
+      kg: '',
+      timeMinutes: timeMin || '1',
+    };
+  }
+  return {
+    reps: s.reps || '',
+    loadKind: 'kg',
+    kg: w,
+    timeMinutes: '',
+  };
+}
+
+function parseStrengthTimeMinutesIndex(s: string): number {
+  const n = parseInt(String(s).replace(/\D/g, ''), 10);
+  if (!Number.isFinite(n) || n < 1) return 0;
+  return Math.min(STRENGTH_TIME_MAX_MIN - 1, n - 1);
+}
+
+function parseStrengthTimePickerTarget(
+  t: string | null,
+): { lineKey: string; exIdx: number; setIdx: number } | null {
+  if (!t) return null;
+  const m = t.match(/^lt:([^:]*):(\d+):(\d+)$/);
+  if (!m) return null;
+  return { lineKey: m[1], exIdx: Number(m[2]), setIdx: Number(m[3]) };
+}
+
+function adjustStrengthTimePickTargetAfterRemove(
+  current: string | null,
+  lineKey: string,
+  exIdx: number,
+  removedSetIdx: number,
+): string | null {
+  if (!current) return null;
+  const ctx = parseStrengthTimePickerTarget(current);
+  if (!ctx) return null;
+  if (ctx.lineKey !== lineKey || ctx.exIdx !== exIdx) return current;
+  if (ctx.setIdx === removedSetIdx) return null;
+  if (ctx.setIdx > removedSetIdx) {
+    return `lt:${lineKey}:${exIdx}:${ctx.setIdx - 1}`;
+  }
+  return current;
+}
+
+function parseStrengthRepsPickerTarget(
+  t: string | null,
+): { lineKey: string; exIdx: number; setIdx: number } | null {
+  if (!t) return null;
+  const m = t.match(/^lr:([^:]*):(\d+):(\d+)$/);
+  if (!m) return null;
+  return { lineKey: m[1], exIdx: Number(m[2]), setIdx: Number(m[3]) };
+}
+
+function parseStrengthRepsWheelIndex(s: string): number {
+  const n = parseInt(String(s).replace(/\D/g, ''), 10);
+  if (!Number.isFinite(n) || n < 1) return 0;
+  return Math.min(STRENGTH_REPS_MAX - 1, n - 1);
+}
+
+function adjustStrengthRepsPickTargetAfterRemove(
+  current: string | null,
+  lineKey: string,
+  exIdx: number,
+  removedSetIdx: number,
+): string | null {
+  if (!current) return null;
+  const ctx = parseStrengthRepsPickerTarget(current);
+  if (!ctx) return null;
+  if (ctx.lineKey !== lineKey || ctx.exIdx !== exIdx) return current;
+  if (ctx.setIdx === removedSetIdx) return null;
+  if (ctx.setIdx > removedSetIdx) {
+    return `lr:${lineKey}:${exIdx}:${ctx.setIdx - 1}`;
+  }
+  return current;
+}
+
+function parseStrengthKgPickerTarget(
+  t: string | null,
+): { lineKey: string; exIdx: number; setIdx: number } | null {
+  if (!t) return null;
+  const m = t.match(/^lk:([^:]*):(\d+):(\d+)$/);
+  if (!m) return null;
+  return { lineKey: m[1], exIdx: Number(m[2]), setIdx: Number(m[3]) };
+}
+
+function parseStrengthKgWheelIndex(s: string): number {
+  const raw = String(s).replace(',', '.').trim();
+  if (!raw) return 0;
+  const f = parseFloat(raw);
+  if (!Number.isFinite(f) || f < 0) return 0;
+  const rounded = Math.round(f);
+  return Math.min(STRENGTH_KG_MAX, Math.max(0, rounded));
+}
+
+function adjustStrengthKgPickTargetAfterRemove(
+  current: string | null,
+  lineKey: string,
+  exIdx: number,
+  removedSetIdx: number,
+): string | null {
+  if (!current) return null;
+  const ctx = parseStrengthKgPickerTarget(current);
+  if (!ctx) return null;
+  if (ctx.lineKey !== lineKey || ctx.exIdx !== exIdx) return current;
+  if (ctx.setIdx === removedSetIdx) return null;
+  if (ctx.setIdx > removedSetIdx) {
+    return `lk:${lineKey}:${exIdx}:${ctx.setIdx - 1}`;
+  }
+  return current;
+}
+
+function parseStrengthSetCountStr(s: string): number {
+  const n = parseInt(String(s).replace(/\D/g, ''), 10);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(MAX_STRENGTH_SET_LINES, n);
+}
+
+function resizeStrengthSetLines(prev: StrengthSetLineForm[], newLen: number): StrengthSetLineForm[] {
+  const n = Math.max(1, Math.min(MAX_STRENGTH_SET_LINES, newLen));
+  const out = prev.slice(0, n);
+  while (out.length < n) {
+    out.push({ reps: '', loadKind: 'kg', kg: '', timeMinutes: '' });
+  }
+  return out;
+}
+
+/** Nytt sett basert på forrige rad: kopierer kun felt som var fylt ut (reps, kg eller tid). */
+function newStrengthSetLineDuplicatedFrom(last: StrengthSetLineForm): StrengthSetLineForm {
+  const reps = last.reps?.trim() ? last.reps.trim() : '';
+  if (last.loadKind === 'time') {
+    return {
+      reps,
+      loadKind: 'time',
+      kg: '',
+      timeMinutes: last.timeMinutes?.trim() ? last.timeMinutes.trim() : '',
+    };
+  }
+  return {
+    reps,
+    loadKind: 'kg',
+    kg: last.kg?.trim() ? last.kg.trim() : '',
+    timeMinutes: '',
+  };
+}
+
+function addStrengthSetToExercise(ex: StrengthExerciseForm): StrengthExerciseForm {
+  if (ex.setLines.length >= MAX_STRENGTH_SET_LINES) return ex;
+  const last = ex.setLines[ex.setLines.length - 1];
+  const setLines = [...ex.setLines, newStrengthSetLineDuplicatedFrom(last)];
+  return {
+    ...ex,
+    setCountStr: String(setLines.length),
+    setLines,
+  };
+}
+
+function removeStrengthSetAt(ex: StrengthExerciseForm, at: number): StrengthExerciseForm {
+  if (ex.setLines.length <= 1) return ex;
+  const setLines = ex.setLines.filter((_, j) => j !== at);
+  return {
+    ...ex,
+    setCountStr: String(setLines.length),
+    setLines,
+  };
+}
+
 type ProgramLineForm = {
   key: string;
   id?: string;
@@ -2569,6 +2923,10 @@ type ProgramLineForm = {
   date: string;
   done: boolean;
   workoutType: string;
+  /** Styrkeøvelser for denne økten (skjema). */
+  strengthExercises?: StrengthExerciseForm[];
+  /** Når sann: vis felter for øvelser; ellers bare valget «Legg til øvelser». */
+  strengthExercisesUIVisible?: boolean;
 };
 
 type ProgramFormDraft = {
@@ -2593,6 +2951,8 @@ function emptyProgramLine(week: number, slot: number): ProgramLineForm {
     date: '',
     done: false,
     workoutType: '',
+    strengthExercises: undefined,
+    strengthExercisesUIVisible: false,
   };
 }
 
@@ -2668,6 +3028,21 @@ function deriveSessionsPerWeek(items: SavedProgramItem[]): number {
   return Math.max(1, Math.min(20, maxCount));
 }
 
+/**
+ * Faktisk ukespenn fra øktenes `week` (høyeste ukenummer).
+ * Stoler ikke på `program.weeks` alene (kan være feil, f.eks. fra chat uten
+ * samsvarende antall faktiske økter). Fungerer også for chat-versjon med `week`.
+ */
+function deriveProgramWeeksFromItems(items: ReadonlyArray<{ week?: number }> | undefined): number {
+  if (!items || items.length === 0) return 1;
+  let maxW = 1;
+  for (const it of items) {
+    const w = Math.max(1, Math.min(52, Math.floor(it.week ?? 1) || 1));
+    if (w > maxW) maxW = w;
+  }
+  return maxW;
+}
+
 function sortRunningProgramItems(items: SavedProgramItem[]): SavedProgramItem[] {
   return [...items].sort((a, b) => {
     if (a.date && b.date) return a.date.localeCompare(b.date);
@@ -2677,20 +3052,87 @@ function sortRunningProgramItems(items: SavedProgramItem[]): SavedProgramItem[] 
   });
 }
 
-function RunningProgramTab({
+function duplicateProgramTitle(base: string): string {
+  const t = base.trim();
+  return t ? `${t} (kopi)` : 'Kopi';
+}
+
+function cloneSavedProgram(
+  p: SavedRunningProgram,
+  newIdPrefix: 'rp' | 'sp',
+): SavedRunningProgram {
+  const id = `${newIdPrefix}-${Date.now()}`;
+  const now = Date.now();
+  const items: SavedProgramItem[] = p.items.map((it, i) => {
+    const newItem: SavedProgramItem = {
+      id: `${id}-item-${i}`,
+      week: it.week,
+      dayLabel: it.dayLabel,
+      title: it.title,
+      description: it.description,
+      done: false,
+      date: it.date,
+      workoutType: it.workoutType,
+    };
+    if (it.strengthExercises && it.strengthExercises.length > 0) {
+      return {
+        ...newItem,
+        strengthExercises: it.strengthExercises.map((ex) => ({
+          name: ex.name,
+          sets: (ex.sets || []).map((s) => {
+            const c: StrengthExerciseSetSaved = {
+              reps: s.reps,
+              loadKind: s.loadKind,
+              weightKg: s.weightKg,
+              timeMinutes: s.timeMinutes,
+            };
+            return c;
+          }),
+        })),
+      };
+    }
+    return newItem;
+  });
+  return {
+    id,
+    title: duplicateProgramTitle(p.title),
+    goalSummary: p.goalSummary,
+    weeks: deriveProgramWeeksFromItems(p.items),
+    competitionName: p.competitionName,
+    competitionDate: p.competitionDate,
+    createdAt: now,
+    updatedAt: now,
+    items,
+  };
+}
+
+function ChecklistProgramTab({
+  variant,
   programs,
   onToggleItem,
   onDeleteProgram,
   onSaveProgram,
-  onMoveRunningProgramInTab,
+  onMoveProgramInTab,
+  onCopyProgram,
+  onPatchStrengthSet,
 }: {
+  variant: 'running' | 'strength';
   programs: SavedRunningProgram[];
   onToggleItem: (programId: string, itemId: string) => void;
   onDeleteProgram: (programId: string) => void;
-  onMoveRunningProgramInTab: (
+  onCopyProgram: (programId: string) => void;
+  onMoveProgramInTab: (
     tab: 'active' | 'completed',
     programId: string,
     direction: 'up' | 'down',
+  ) => void;
+  /** Styrke: avkryss per sett og endre logget reps/kg/min. */
+  onPatchStrengthSet?: (
+    programId: string,
+    itemId: string,
+    exIdx: number,
+    setIdx: number,
+    patch: Partial<Pick<StrengthExerciseSetSaved, 'setDone' | 'actualReps' | 'actualWeightKg' | 'actualTimeMinutes'>>,
   ) => void;
   onSaveProgram: (payload: {
     mode: 'create' | 'edit';
@@ -2709,9 +3151,12 @@ function RunningProgramTab({
       date?: string;
       done: boolean;
       workoutType?: string;
+      strengthExercises?: StrengthExerciseSaved[];
     }>;
   }) => void;
 }) {
+  const isRun = variant === 'running';
+  const workoutOptions = isRun ? runWorkoutTypeOptions : strengthWorkoutTypeOptions;
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const [expandedItemIds, setExpandedItemIds] = useState<Record<string, boolean>>({});
   const [programTab, setProgramTab] = useState<'active' | 'completed'>('active');
@@ -2727,8 +3172,36 @@ function RunningProgramTab({
   const [weekPickerLineKey, setWeekPickerLineKey] = useState<string | null>(null);
   const [showWeeksPicker, setShowWeeksPicker] = useState(false);
   const [showSessionsPerWeekPicker, setShowSessionsPerWeekPicker] = useState(false);
+  /** `lt:lineKey:exIdx:setIdx` for tid (minutter) hjulvelger. */
+  const [strengthTimePickTarget, setStrengthTimePickTarget] = useState<string | null>(null);
+  /** `lr:lineKey:exIdx:setIdx` for reps-hjulvelger. */
+  const [strengthRepsPickTarget, setStrengthRepsPickTarget] = useState<string | null>(null);
+  /** `lk:lineKey:exIdx:setIdx` for kg-hjulvelger. */
+  const [strengthKgPickTarget, setStrengthKgPickTarget] = useState<string | null>(null);
+  /** Sjekkliste: hjul for logget reps / kg / min (når følger styrkeprogram). */
+  const [checklistLogPick, setChecklistLogPick] = useState<{
+    field: 'reps' | 'kg' | 'time';
+    programId: string;
+    itemId: string;
+    exIdx: number;
+    setIdx: number;
+  } | null>(null);
   const [expandedFormLines, setExpandedFormLines] = useState<Record<string, boolean>>({});
   const [expandedFormWeeks, setExpandedFormWeeks] = useState<Record<number, boolean>>({});
+
+  useEffect(() => {
+    if (formOpen) setChecklistLogPick(null);
+  }, [formOpen]);
+
+  function getChecklistProgramStrengthSet(
+    programId: string,
+    itemId: string,
+    exIdx: number,
+    setIdx: number,
+  ): StrengthExerciseSetSaved | null {
+    const p = programs.find((x) => x.id === programId);
+    return p?.items.find((i) => i.id === itemId)?.strengthExercises?.[exIdx]?.sets?.[setIdx] ?? null;
+  }
 
   function isFormLineOpen(key: string) {
     return !!expandedFormLines[key];
@@ -2778,10 +3251,12 @@ function RunningProgramTab({
 
   const visiblePrograms = useMemo(() => {
     return programs.filter((p) => {
-      const isCompleted = p.items.length > 0 && p.items.every((it) => it.done);
+      const isCompleted =
+        p.items.length > 0 &&
+        p.items.every((it) => (isRun ? it.done : strengthChecklistItemDone(it)));
       return programTab === 'completed' ? isCompleted : !isCompleted;
     });
-  }, [programs, programTab]);
+  }, [programs, programTab, isRun]);
 
   useEffect(() => {
     setReorderEditMode(false);
@@ -2809,19 +3284,40 @@ function RunningProgramTab({
       goalSummary: p.goalSummary,
       competitionName: p.competitionName || '',
       competitionDate: p.competitionDate || '',
-      weeksStr: String(p.weeks),
+      weeksStr: String(deriveProgramWeeksFromItems(p.items)),
       sessionsPerWeekStr: String(deriveSessionsPerWeek(p.items)),
-      lines: p.items.map((it) => ({
-        key: it.id,
-        id: it.id,
-        week: String(it.week),
-        dayLabel: it.dayLabel,
-        title: it.title,
-        description: it.description,
-        date: it.date || '',
-        done: it.done,
-        workoutType: it.workoutType || '',
-      })),
+      lines: p.items.map((it) => {
+        const base: ProgramLineForm = {
+          key: it.id,
+          id: it.id,
+          week: String(it.week),
+          dayLabel: it.dayLabel,
+          title: isRun ? it.title : '',
+          description: it.description,
+          date: it.date || '',
+          done: it.done,
+          workoutType: it.workoutType || '',
+        };
+        if (!isRun) {
+          const hasEx = !!(it.strengthExercises && it.strengthExercises.length);
+          return {
+            ...base,
+            strengthExercisesUIVisible: hasEx,
+            strengthExercises: hasEx
+              ? it.strengthExercises!.map((ex) => ({
+                  key: newStrengthExerciseFormKey(),
+                  name: ex.name,
+                  setCountStr: String(Math.max(1, ex.sets?.length || 1)),
+                  setLines:
+                    ex.sets && ex.sets.length
+                      ? ex.sets.map(savedStrengthSetToFormLine)
+                      : [{ reps: '', loadKind: 'kg', kg: '', timeMinutes: '' }],
+                }))
+              : undefined,
+          };
+        }
+        return base;
+      }),
     });
     setFormOpen(true);
   }
@@ -2871,6 +3367,10 @@ function RunningProgramTab({
     setWeekPickerLineKey(null);
     setShowWeeksPicker(false);
     setShowSessionsPerWeekPicker(false);
+    setStrengthTimePickTarget(null);
+    setStrengthRepsPickTarget(null);
+    setStrengthKgPickTarget(null);
+    setChecklistLogPick(null);
     setExpandedFormLines({});
     setExpandedFormWeeks({});
     setFormDraft(createEmptyCreateDraft());
@@ -2895,27 +3395,88 @@ function RunningProgramTab({
     const parsedLines = formDraft.lines
       .map((l) => {
         const w = Math.max(1, Math.min(52, parseInt(String(l.week).replace(/\D/g, ''), 10) || 1));
-        return {
+        const base: {
+          id?: string;
+          week: number;
+          dayLabel: string;
+          title: string;
+          description: string;
+          date?: string;
+          done: boolean;
+          workoutType?: string;
+          strengthExercises?: StrengthExerciseSaved[];
+        } = {
           id: l.id,
           week: w,
           dayLabel: l.dayLabel.trim() || 'Økt',
-          title: l.title.trim(),
+          title: isRun ? l.title.trim() : '',
           description: l.description.trim(),
           date: l.date.trim() || undefined,
           done: l.done,
           workoutType: l.workoutType.trim() || undefined,
         };
+        if (!isRun) {
+          if (l.strengthExercisesUIVisible) {
+            const exForms = l.strengthExercises?.length ? l.strengthExercises : [emptyStrengthExercise()];
+            const se: StrengthExerciseSaved[] = exForms
+              .map((ex) => {
+                const n = parseStrengthSetCountStr(ex.setCountStr);
+                const lines = resizeStrengthSetLines(ex.setLines, n);
+                return {
+                  name: ex.name.trim(),
+                  sets: lines.map((row) => {
+                    const reps = row.reps.trim();
+                    if (row.loadKind === 'time') {
+                      return {
+                        reps,
+                        loadKind: 'time' as const,
+                        timeMinutes: row.timeMinutes.trim(),
+                      };
+                    }
+                    return {
+                      reps,
+                      loadKind: 'kg' as const,
+                      weightKg: row.kg.trim(),
+                    };
+                  }),
+                };
+              })
+              .filter((ex) =>
+                ex.name.length > 0 ||
+                ex.sets.some(
+                  (s) =>
+                    s.reps ||
+                    (s.loadKind === 'time' ? s.timeMinutes : s.weightKg),
+                ),
+              );
+            if (se.length > 0) base.strengthExercises = se;
+          }
+        }
+        return base;
       })
-      .filter((l) => l.title.length > 0);
+      .filter((l) => {
+        if (isRun) return l.title.length > 0;
+        return (
+          (l.workoutType && l.workoutType.length > 0) ||
+          (l.description && l.description.length > 0) ||
+          (l.date && l.date.length > 0) ||
+          (l.strengthExercises && l.strengthExercises.length > 0)
+        );
+      });
     if (parsedLines.length === 0) {
-      Alert.alert('Minst én økt', 'Fyll inn tittel på minst én økt.');
+      Alert.alert(
+        'Minst én økt',
+        isRun
+          ? 'Fyll inn tittel på minst én økt.'
+          : 'Legg inn minst én økt, f.eks. type økt, dato, notat eller øvelser.',
+      );
       return;
     }
     const w = Math.max(1, Math.min(52, parseInt(formDraft.weeksStr.replace(/\D/g, ''), 10) || 1));
-    const competitionName = formDraft.competitionName.trim();
-    const competitionDateRaw = formDraft.competitionDate.trim();
+    const competitionName = isRun ? formDraft.competitionName.trim() : '';
+    const competitionDateRaw = isRun ? formDraft.competitionDate.trim() : '';
     const competitionDate =
-      competitionDateRaw && /^\d{4}-\d{2}-\d{2}$/.test(competitionDateRaw)
+      isRun && competitionDateRaw && /^\d{4}-\d{2}-\d{2}$/.test(competitionDateRaw)
         ? competitionDateRaw
         : undefined;
     if (formDraft.mode === 'create') {
@@ -2923,7 +3484,7 @@ function RunningProgramTab({
         mode: 'create',
         title,
         goalSummary: formDraft.goalSummary.trim(),
-        competitionName: competitionName || undefined,
+        competitionName: (isRun && competitionName) || undefined,
         competitionDate,
         weeks: w,
         items: parsedLines.map((l) => ({ ...l, done: false })),
@@ -2934,7 +3495,7 @@ function RunningProgramTab({
         programId: formDraft.programId,
         title,
         goalSummary: formDraft.goalSummary.trim(),
-        competitionName: competitionName || undefined,
+        competitionName: (isRun && competitionName) || undefined,
         competitionDate,
         weeks: w,
         items: parsedLines,
@@ -2952,9 +3513,11 @@ function RunningProgramTab({
             onPress={openCreateModal}
             style={({ pressed }) => [styles.newChecklistButton, pressed && { opacity: 0.8, transform: [{ scale: 0.98 }] }]}
             accessibilityRole="button"
-            accessibilityLabel="Nytt løpeprogram"
+            accessibilityLabel={isRun ? 'Nytt løpeprogram' : 'Nytt styrkeprogram'}
           >
-            <Text style={styles.newChecklistButtonText}>Nytt løpeprogram</Text>
+            <Text style={styles.newChecklistButtonText}>
+              {isRun ? 'Nytt løpeprogram' : 'Nytt styrkeprogram'}
+            </Text>
           </Pressable>
         </View>
 
@@ -2983,7 +3546,7 @@ function RunningProgramTab({
                       style={[styles.programSubTab, active && styles.programSubTabActive]}
                       accessibilityRole="button"
                       accessibilityState={{ selected: active }}
-                      accessibilityLabel={`${tab.label} løpeprogrammer`}
+                      accessibilityLabel={`${tab.label} ${isRun ? 'løpe' : 'styrke'}programmer`}
                     >
                       <Text
                         style={[styles.programSubTabText, active && styles.programSubTabTextActive]}
@@ -3008,7 +3571,9 @@ function RunningProgramTab({
                     accessibilityLabel={
                       reorderEditMode
                         ? 'Avslutt redigering av rekkefølge'
-                        : 'Endre rekkefølge på løpeprogrammer'
+                        : isRun
+                          ? 'Endre rekkefølge på løpeprogrammer'
+                          : 'Endre rekkefølge på styrkeprogrammer'
                     }
                   >
                     <FontAwesome6
@@ -3033,9 +3598,13 @@ function RunningProgramTab({
 
         {programs.length === 0 ? (
           <View style={styles.programTabEmptyCard}>
-            <Text style={styles.programTabEmptyTitle}>Løpeprogram</Text>
+            <Text style={styles.programTabEmptyTitle}>
+              {isRun ? 'Løpeprogram' : 'Styrkeprogram'}
+            </Text>
             <Text style={styles.programTabBodyText}>
-              Ingen lagrede programmer ennå. Opprett et program over, eller gå til Chat og be om et program – trykk deretter «Lagre som løpeprogram» på svaret.
+              {isRun
+                ? 'Ingen lagrede programmer ennå. Opprett et program over, eller gå til Chat og be om et program – trykk deretter «Lagre som løpeprogram» på svaret.'
+                : 'Ingen lagrede programmer ennå. Opprett et program over, eller gå til Chat og be om et styrkeprogram – trykk deretter «Lagre som styrkeprogram» på svaret.'}
             </Text>
           </View>
         ) : null}
@@ -3044,15 +3613,21 @@ function RunningProgramTab({
           <View style={styles.programTabEmptyCard}>
             <Text style={styles.programTabBodyText}>
               {programTab === 'completed'
-                ? 'Ingen fullførte løpeprogrammer ennå. Kryss av alle øktene i et program for å fullføre det.'
-                : 'Ingen aktive løpeprogrammer akkurat nå. Opprett et nytt program over.'}
+                ? isRun
+                  ? 'Ingen fullførte løpeprogrammer ennå. Kryss av alle øktene i et program for å fullføre det.'
+                  : 'Ingen fullførte styrkeprogrammer ennå. Kryss av alle sett i hver styrkeøkt, eller hele økten der du ikke har detaljerte sett planlagt.'
+                : isRun
+                  ? 'Ingen aktive løpeprogrammer akkurat nå. Opprett et nytt program over.'
+                  : 'Ingen aktive styrkeprogrammer akkurat nå. Opprett et nytt program over.'}
             </Text>
           </View>
         ) : null}
 
         {visiblePrograms.length > 0
           ? visiblePrograms.map((p, index) => {
-              const doneCount = p.items.filter((i) => i.done).length;
+              const doneCount = p.items.filter((i) =>
+                isRun ? i.done : strengthChecklistItemDone(i),
+              ).length;
               const total = p.items.length;
               const expanded = expandedIds[p.id] ?? false;
               const sorted = sortRunningProgramItems(p.items);
@@ -3074,7 +3649,7 @@ function RunningProgramTab({
                                 onPress={() => {
                                   if (!canMoveUp) return;
                                   void Haptics.selectionAsync();
-                                  onMoveRunningProgramInTab(programTab, p.id, 'up');
+                                  onMoveProgramInTab(programTab, p.id, 'up');
                                 }}
                                 disabled={!canMoveUp}
                                 style={({ pressed }) => [
@@ -3098,7 +3673,7 @@ function RunningProgramTab({
                                 onPress={() => {
                                   if (!canMoveDown) return;
                                   void Haptics.selectionAsync();
-                                  onMoveRunningProgramInTab(programTab, p.id, 'down');
+                                  onMoveProgramInTab(programTab, p.id, 'down');
                                 }}
                                 disabled={!canMoveDown}
                                 style={({ pressed }) => [
@@ -3143,7 +3718,7 @@ function RunningProgramTab({
                               >
                                 {p.goalSummary}
                               </Text>
-                              {p.competitionName || p.competitionDate ? (
+                              {isRun && (p.competitionName || p.competitionDate) ? (
                                 <Text style={styles.programCompetitionLine} numberOfLines={expanded ? undefined : 2}>
                                   🏁{' '}
                                   {[p.competitionName, p.competitionDate ? formatNorwegianDate(p.competitionDate) : null]
@@ -3154,6 +3729,20 @@ function RunningProgramTab({
                             </View>
                           </Pressable>
                           <View style={styles.programHeaderActions}>
+                            <Pressable
+                              onPress={() => {
+                                void Haptics.selectionAsync();
+                                onCopyProgram(p.id);
+                                void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                              }}
+                              style={({ pressed }) => [styles.sessionEditIconBtn, pressed && { opacity: 0.5 }]}
+                              accessibilityRole="button"
+                              accessibilityLabel={`Kopier ${p.title}`}
+                              accessibilityHint="Lager en kopi av programmet med ny tittel"
+                              hitSlop={8}
+                            >
+                              <FontAwesome6 name="copy" size={16} color="#7A3C4A" solid />
+                            </Pressable>
                             <Pressable
                               onPress={() => {
                                 void Haptics.selectionAsync();
@@ -3191,7 +3780,7 @@ function RunningProgramTab({
                           }
                         >
                           <Text style={[styles.programMeta, { flex: 1 }]}>
-                            {p.weeks} uker · {doneCount}/{total} økter fullført
+                            {deriveProgramWeeksFromItems(p.items)} uker · {doneCount}/{total} økter fullført
                           </Text>
                           <Text style={styles.programUpdatedAt} numberOfLines={1}>
                             {`Sist oppdatert ${formatProgramUpdatedAt(p.updatedAt ?? p.createdAt)}`}
@@ -3203,68 +3792,314 @@ function RunningProgramTab({
                           {sorted.map((item) => {
                             const itemOpen = !!expandedItemIds[item.id];
                             const hasDescription = !!item.description?.trim();
+                            const hasStrengthDetail =
+                              !isRun &&
+                              (item.strengthExercises?.some(
+                                (e) =>
+                                  e.name?.trim() ||
+                                  e.sets?.some(
+                                    (s) =>
+                                      s.reps?.trim() ||
+                                      s.weightKg?.trim() ||
+                                      s.timeMinutes?.trim(),
+                                  ),
+                              ) ??
+                                false);
+                            const hasStrengthSets =
+                              !isRun &&
+                              (item.strengthExercises?.some((e) => (e.sets?.length || 0) > 0) ?? false);
+                            const useSetLevelStrength = !!onPatchStrengthSet && hasStrengthSets;
+                            const itemRowDone = isRun ? item.done : strengthChecklistItemDone(item);
+                            const canExpand = hasDescription || hasStrengthDetail || hasStrengthSets;
                             return (
                               <View
                                 key={item.id}
-                                style={[styles.programCheckRow, item.done && styles.programCheckRowDone]}
+                                style={[
+                                  styles.programCheckRow,
+                                  itemRowDone && styles.programCheckRowDone,
+                                ]}
                               >
-                                <Pressable
-                                  onPress={() => onToggleItem(p.id, item.id)}
-                                  style={({ pressed }) => [
-                                    styles.programCheckBoxBtn,
-                                    pressed && { opacity: 0.6 },
-                                  ]}
-                                  hitSlop={8}
-                                  accessibilityRole="checkbox"
-                                  accessibilityState={{ checked: item.done }}
-                                  accessibilityLabel={
-                                    item.done
-                                      ? 'Marker økten som ikke fullført'
-                                      : 'Marker økten som fullført'
-                                  }
-                                >
-                                  <Text style={styles.programCheckMark}>{item.done ? '☑' : '☐'}</Text>
-                                </Pressable>
-                                <Pressable
-                                  onPress={() => toggleItemExpanded(item.id)}
-                                  style={{ flex: 1, gap: 2 }}
-                                  accessibilityRole="button"
-                                  accessibilityLabel={
-                                    itemOpen ? 'Skjul detaljer for økten' : 'Vis detaljer for økten'
-                                  }
-                                >
-                                  <Text
-                                    style={[styles.programItemDate, item.done && styles.programCheckDescDone]}
+                                {isRun || !useSetLevelStrength ? (
+                                  <Pressable
+                                    onPress={() => onToggleItem(p.id, item.id)}
+                                    style={({ pressed }) => [
+                                      styles.programCheckBoxBtn,
+                                      pressed && { opacity: 0.6 },
+                                    ]}
+                                    hitSlop={8}
+                                    accessibilityRole="checkbox"
+                                    accessibilityState={{ checked: itemRowDone }}
+                                    accessibilityLabel={
+                                      itemRowDone
+                                        ? 'Marker økten som ikke fullført'
+                                        : 'Marker økten som fullført'
+                                    }
                                   >
-                                    {[
-                                      `Uke ${item.week}`,
-                                      item.date ? formatNorwegianDate(item.date) : null,
-                                      item.workoutType
-                                        ? `${runWorkoutTypeOptions.find((o) => o.value === item.workoutType)?.emoji ?? '🏃'} ${runWorkoutTypeLabel(item.workoutType)}`
-                                        : null,
-                                    ]
-                                      .filter(Boolean)
-                                      .join(' – ')}
-                                  </Text>
-                                  {!(item.workoutType && item.title.trim() === item.workoutType.trim()) ? (
-                                    <Text
-                                      style={[styles.programCheckTitle, item.done && styles.programCheckTitleDone]}
-                                    >
-                                      {item.title}
+                                    <Text style={styles.programCheckMark}>
+                                      {itemRowDone ? '☑' : '☐'}
                                     </Text>
-                                  ) : null}
+                                  </Pressable>
+                                ) : useSetLevelStrength ? null : (
+                                  <View style={styles.programCheckBoxBtn} />
+                                )}
+                                <View style={styles.programCheckItemBody}>
+                                  <Pressable
+                                    onPress={() => toggleItemExpanded(item.id)}
+                                    style={[
+                                      { gap: 2 },
+                                      canExpand && styles.programCheckItemTopPadForChevron,
+                                    ]}
+                                    accessibilityRole="button"
+                                    accessibilityLabel={
+                                      itemOpen ? 'Skjul detaljer for økten' : 'Vis detaljer for økten'
+                                    }
+                                  >
+                                    <Text
+                                      style={[
+                                        styles.programItemDate,
+                                        itemRowDone && styles.programCheckDescDone,
+                                      ]}
+                                    >
+                                      {[
+                                        `Uke ${item.week}`,
+                                        item.date ? formatNorwegianDate(item.date) : null,
+                                        item.workoutType
+                                          ? isRun
+                                            ? `${runWorkoutTypeOptions.find((o) => o.value === item.workoutType)?.emoji ?? '🏃'} ${runWorkoutTypeLabel(item.workoutType)}`
+                                            : `${strengthWorkoutTypeOptions.find((o) => o.value === item.workoutType)?.emoji ?? '💪'} ${strengthWorkoutTypeLabel(item.workoutType)}`
+                                          : null,
+                                      ]
+                                        .filter(Boolean)
+                                        .join(' – ')}
+                                    </Text>
+                                    {isRun &&
+                                    !(item.workoutType && item.title.trim() === item.workoutType.trim()) ? (
+                                      <Text
+                                        style={[
+                                          styles.programCheckTitle,
+                                          itemRowDone && styles.programCheckTitleDone,
+                                        ]}
+                                      >
+                                        {item.title}
+                                      </Text>
+                                    ) : null}
+                                  </Pressable>
+                                  {itemOpen && (hasStrengthDetail || hasStrengthSets)
+                                    ? item.strengthExercises?.map((ex, exI) => (
+                                        <View
+                                          key={`ex-${exI}`}
+                                          style={{ marginTop: exI > 0 ? 8 : 2, gap: 4 }}
+                                        >
+                                          {ex.name?.trim() ? (
+                                            <Text
+                                              style={[
+                                                styles.programCheckTitle,
+                                                itemRowDone && styles.programCheckTitleDone,
+                                              ]}
+                                            >
+                                              {ex.name.trim()}
+                                            </Text>
+                                          ) : null}
+                                          {ex.sets?.map((s, si) => {
+                                            const isTime =
+                                              s.loadKind === 'time' ||
+                                              (!!s.timeMinutes?.trim() && s.loadKind !== 'kg');
+                                            const setChecked = strengthSetEffectiveDone(s, item.done);
+                                            if (useSetLevelStrength && onPatchStrengthSet) {
+                                              const load = strengthSetDisplayLoad(s);
+                                              return (
+                                                <View key={si} style={styles.strengthSetLogRow}>
+                                                  <Pressable
+                                                    onPress={() => {
+                                                      void Haptics.selectionAsync();
+                                                      onPatchStrengthSet(p.id, item.id, exI, si, {
+                                                        setDone: !setChecked,
+                                                      });
+                                                    }}
+                                                    style={({ pressed }) => [
+                                                      styles.strengthSetCheckBoxBtn,
+                                                      pressed && { opacity: 0.6 },
+                                                    ]}
+                                                    hitSlop={6}
+                                                    accessibilityRole="checkbox"
+                                                    accessibilityState={{ checked: setChecked }}
+                                                    accessibilityLabel={
+                                                      setChecked
+                                                        ? 'Marker settet som ikke utført'
+                                                        : 'Marker settet som utført'
+                                                    }
+                                                  >
+                                                    <Text style={styles.strengthSetCheckMark}>
+                                                      {setChecked ? '☑' : '☐'}
+                                                    </Text>
+                                                  </Pressable>
+                                                  <Text style={styles.strengthSetLogHint}>reps</Text>
+                                                  <Pressable
+                                                    onPress={() => {
+                                                      void Haptics.selectionAsync();
+                                                      setStrengthTimePickTarget(null);
+                                                      setStrengthRepsPickTarget(null);
+                                                      setStrengthKgPickTarget(null);
+                                                      setChecklistLogPick({
+                                                        field: 'reps',
+                                                        programId: p.id,
+                                                        itemId: item.id,
+                                                        exIdx: exI,
+                                                        setIdx: si,
+                                                      });
+                                                    }}
+                                                    style={[
+                                                      styles.dropdownButton,
+                                                      styles.strengthSetLogDropdownCompact,
+                                                      styles.strengthSetLogDropdown,
+                                                    ]}
+                                                    accessibilityRole="button"
+                                                    accessibilityLabel="Velg antall reps"
+                                                  >
+                                                    <Text
+                                                      style={[
+                                                        styles.dropdownButtonText,
+                                                        styles.strengthSetLogDropdownValueText,
+                                                        { flex: 1, minWidth: 0 },
+                                                        !strengthSetDisplayReps(s).trim() &&
+                                                          styles.dropdownButtonPlaceholder,
+                                                      ]}
+                                                      numberOfLines={1}
+                                                    >
+                                                      {strengthSetDisplayReps(s).trim()
+                                                        ? strengthSetDisplayReps(s).trim()
+                                                        : '—'}
+                                                    </Text>
+                                                    <Text style={styles.dropdownChevron}>▾</Text>
+                                                  </Pressable>
+                                                  {isTime ? (
+                                                    <>
+                                                      <Text style={styles.strengthSetLogHint}>min</Text>
+                                                      <Pressable
+                                                        onPress={() => {
+                                                          void Haptics.selectionAsync();
+                                                          setStrengthTimePickTarget(null);
+                                                          setStrengthRepsPickTarget(null);
+                                                          setStrengthKgPickTarget(null);
+                                                          setChecklistLogPick({
+                                                            field: 'time',
+                                                            programId: p.id,
+                                                            itemId: item.id,
+                                                            exIdx: exI,
+                                                            setIdx: si,
+                                                          });
+                                                        }}
+                                                        style={[
+                                                          styles.dropdownButton,
+                                                          styles.strengthSetLogDropdownCompact,
+                                                          styles.strengthSetLogDropdownLoad,
+                                                        ]}
+                                                        accessibilityRole="button"
+                                                        accessibilityLabel="Velg tid i minutter"
+                                                      >
+                                                        <Text
+                                                          style={[
+                                                            styles.dropdownButtonText,
+                                                            styles.strengthSetLogDropdownValueText,
+                                                            { flex: 1, minWidth: 0 },
+                                                            !load.text.trim() && styles.dropdownButtonPlaceholder,
+                                                          ]}
+                                                          numberOfLines={1}
+                                                        >
+                                                          {load.text.trim()
+                                                            ? `${load.text.trim()} min`
+                                                            : 'Tid'}
+                                                        </Text>
+                                                        <Text style={styles.dropdownChevron}>▾</Text>
+                                                      </Pressable>
+                                                    </>
+                                                  ) : (
+                                                    <>
+                                                      <Text style={styles.strengthSetLogHint}>kg</Text>
+                                                      <Pressable
+                                                        onPress={() => {
+                                                          void Haptics.selectionAsync();
+                                                          setStrengthTimePickTarget(null);
+                                                          setStrengthRepsPickTarget(null);
+                                                          setStrengthKgPickTarget(null);
+                                                          setChecklistLogPick({
+                                                            field: 'kg',
+                                                            programId: p.id,
+                                                            itemId: item.id,
+                                                            exIdx: exI,
+                                                            setIdx: si,
+                                                          });
+                                                        }}
+                                                        style={[
+                                                          styles.dropdownButton,
+                                                          styles.strengthSetLogDropdownCompact,
+                                                          styles.strengthSetLogDropdownLoad,
+                                                        ]}
+                                                        accessibilityRole="button"
+                                                        accessibilityLabel="Velg vekt i kilo"
+                                                      >
+                                                        <Text
+                                                          style={[
+                                                            styles.dropdownButtonText,
+                                                            styles.strengthSetLogDropdownValueText,
+                                                            { flex: 1, minWidth: 0 },
+                                                            !load.text.trim() && styles.dropdownButtonPlaceholder,
+                                                          ]}
+                                                          numberOfLines={1}
+                                                        >
+                                                          {load.text.trim()
+                                                            ? `${load.text.trim()} kg`
+                                                            : 'kg'}
+                                                        </Text>
+                                                        <Text style={styles.dropdownChevron}>▾</Text>
+                                                      </Pressable>
+                                                    </>
+                                                  )}
+                                                </View>
+                                              );
+                                            }
+                                            const loadStr = isTime
+                                              ? s.timeMinutes?.trim()
+                                                ? `${s.timeMinutes.trim()} min`
+                                                : null
+                                              : s.weightKg?.trim()
+                                                ? `${s.weightKg.trim()} kg`
+                                                : null;
+                                            return (
+                                              <Text
+                                                key={si}
+                                                style={[
+                                                  styles.programCheckDesc,
+                                                  itemRowDone && styles.programCheckDescDone,
+                                                ]}
+                                              >
+                                                {[
+                                                  s.reps?.trim() ? `${s.reps.trim()} reps` : null,
+                                                  loadStr,
+                                                ]
+                                                  .filter(Boolean)
+                                                  .join(' · ')}
+                                              </Text>
+                                            );
+                                          })}
+                                        </View>
+                                      ))
+                                    : null}
                                   {itemOpen && hasDescription ? (
                                     <Text
-                                      style={[styles.programCheckDesc, item.done && styles.programCheckDescDone]}
+                                      style={[
+                                        styles.programCheckDesc,
+                                        itemRowDone && styles.programCheckDescDone,
+                                      ]}
                                     >
                                       {item.description}
                                     </Text>
                                   ) : null}
-                                </Pressable>
-                                {hasDescription ? (
+                                </View>
+                                {canExpand ? (
                                   <Pressable
                                     onPress={() => toggleItemExpanded(item.id)}
-                                    style={styles.programItemChevronBtn}
+                                    style={styles.programItemChevronBtnAbsolute}
                                     hitSlop={8}
                                     accessibilityRole="button"
                                     accessibilityLabel={
@@ -3291,14 +4126,22 @@ function RunningProgramTab({
         <SafeAreaView style={styles.programFormModalSafe}>
           <View style={styles.programFormModalHeader}>
             <Text style={styles.programFormModalTitle} numberOfLines={1}>
-              {formDraft.mode === 'edit' ? 'Rediger sjekkliste' : 'Nytt løpeprogram'}
+              {formDraft.mode === 'edit' ? 'Rediger program' : isRun ? 'Nytt løpeprogram' : 'Nytt styrkeprogram'}
             </Text>
             <View style={styles.programFormModalHeaderActions}>
               <Pressable
                 onPress={submitProgramForm}
                 style={styles.programFormModalSave}
                 accessibilityRole="button"
-                accessibilityLabel={formDraft.mode === 'edit' ? 'Lagre løpeprogram' : 'Opprett løpeprogram'}
+                accessibilityLabel={
+                  formDraft.mode === 'edit'
+                    ? isRun
+                      ? 'Lagre løpeprogram'
+                      : 'Lagre styrkeprogram'
+                    : isRun
+                      ? 'Opprett løpeprogram'
+                      : 'Opprett styrkeprogram'
+                }
               >
                 <Text style={styles.programFormModalSaveText}>
                   {formDraft.mode === 'edit' ? 'Lagre' : 'Opprett'}
@@ -3331,49 +4174,53 @@ function RunningProgramTab({
                 multiline
               />
 
-              <Text style={styles.fieldLabel}>Konkurranse (valgfritt)</Text>
-              <TextInput
-                value={formDraft.competitionName}
-                onChangeText={(t) => setFormDraft((d) => ({ ...d, competitionName: t }))}
-                placeholder="F.eks. Oslo halvmaraton"
-                style={styles.input}
-              />
-              <View style={styles.field}>
-                <Text style={styles.fieldLabel}>Konkurranse-dato</Text>
-                <Pressable
-                  onPress={() => {
-                    void Haptics.selectionAsync();
-                    setDatePickerLineKey(null);
-                    setCompetitionDatePickerOpen(true);
-                  }}
-                  style={styles.dropdownButton}
-                  accessibilityRole="button"
-                  accessibilityLabel="Velg konkurranse-dato"
-                >
-                  <Text
-                    style={[
-                      styles.dropdownButtonText,
-                      !formDraft.competitionDate && styles.dropdownButtonPlaceholder,
-                    ]}
-                  >
-                    {displayDate(formDraft.competitionDate)}
-                  </Text>
-                  <Text style={styles.dropdownChevron}>📅</Text>
-                </Pressable>
-                {formDraft.competitionDate ? (
-                  <Pressable
-                    onPress={() => {
-                      void Haptics.selectionAsync();
-                      setFormDraft((d) => ({ ...d, competitionDate: '' }));
-                    }}
-                    style={{ marginTop: 8 }}
-                    accessibilityRole="button"
-                    accessibilityLabel="Fjern konkurranse-dato"
-                  >
-                    <Text style={styles.muted}>Fjern dato</Text>
-                  </Pressable>
-                ) : null}
-              </View>
+              {isRun ? (
+                <>
+                  <Text style={styles.fieldLabel}>Konkurranse (valgfritt)</Text>
+                  <TextInput
+                    value={formDraft.competitionName}
+                    onChangeText={(t) => setFormDraft((d) => ({ ...d, competitionName: t }))}
+                    placeholder="F.eks. Oslo halvmaraton"
+                    style={styles.input}
+                  />
+                  <View style={styles.field}>
+                    <Text style={styles.fieldLabel}>Konkurranse-dato</Text>
+                    <Pressable
+                      onPress={() => {
+                        void Haptics.selectionAsync();
+                        setDatePickerLineKey(null);
+                        setCompetitionDatePickerOpen(true);
+                      }}
+                      style={styles.dropdownButton}
+                      accessibilityRole="button"
+                      accessibilityLabel="Velg konkurranse-dato"
+                    >
+                      <Text
+                        style={[
+                          styles.dropdownButtonText,
+                          !formDraft.competitionDate && styles.dropdownButtonPlaceholder,
+                        ]}
+                      >
+                        {displayDate(formDraft.competitionDate)}
+                      </Text>
+                      <Text style={styles.dropdownChevron}>📅</Text>
+                    </Pressable>
+                    {formDraft.competitionDate ? (
+                      <Pressable
+                        onPress={() => {
+                          void Haptics.selectionAsync();
+                          setFormDraft((d) => ({ ...d, competitionDate: '' }));
+                        }}
+                        style={{ marginTop: 8 }}
+                        accessibilityRole="button"
+                        accessibilityLabel="Fjern konkurranse-dato"
+                      >
+                        <Text style={styles.muted}>Fjern dato</Text>
+                      </Pressable>
+                    ) : null}
+                  </View>
+                </>
+              ) : null}
 
               <View style={{ flexDirection: 'row', gap: 12 }}>
                 <View style={{ flex: 1 }}>
@@ -3478,19 +4325,18 @@ function RunningProgramTab({
                               1,
                               parseInt((line.week || '1').replace(/\D/g, ''), 10) || 1,
                             );
-                            const workoutOption = runWorkoutTypeOptions.find(
+                            const workoutOption = workoutOptions.find(
                               (o) => o.value === line.workoutType,
                             );
                             const summaryParts: string[] = [`Uke ${lineWeekNum}`];
                             if (workoutOption) {
                               summaryParts.push(`${workoutOption.emoji} ${workoutOption.label}`);
-                            } else if (line.title.trim()) {
+                            } else if (isRun && line.title.trim()) {
                               summaryParts.push(line.title.trim());
                             }
                             const summary = summaryParts.join(' · ');
                             const canDeleteLine = formDraft.lines.length > 1;
-                            const cardContent = (
-                  <View style={styles.programFormLineCard}>
+                            const lineHeader = (
                     <Pressable
                       onPress={() => toggleFormLineExpanded(line.key)}
                       style={styles.programFormLineHeader}
@@ -3509,21 +4355,48 @@ function RunningProgramTab({
                       </View>
                       <Text style={styles.programFormLineChevron}>{open ? '▼' : '▶'}</Text>
                     </Pressable>
+                            );
+                            const cardContent = (
+                  <View style={styles.programFormLineCard}>
+                    {canDeleteLine ? (
+                      <SwipeToDelete
+                        onDelete={() =>
+                          setFormDraft((d) => ({
+                            ...d,
+                            lines: d.lines.filter((_, i) => i !== index),
+                          }))
+                        }
+                        confirmTitle="Slett økt?"
+                        confirmMessage={
+                          isRun
+                            ? `"${line.title.trim() || 'Økt'}" fjernes fra programmet.`
+                            : 'Denne økten fjernes fra programmet.'
+                        }
+                      >
+                        <View>{lineHeader}</View>
+                      </SwipeToDelete>
+                    ) : (
+                      lineHeader
+                    )}
                     {open ? (
                       <View style={styles.programFormLineBody}>
-                        <Text style={styles.fieldLabel}>Tittel</Text>
-                        <TextInput
-                          value={line.title}
-                          onChangeText={(t) => {
-                            setFormDraft((d) => {
-                              const next = [...d.lines];
-                              next[index] = { ...next[index], title: t };
-                              return { ...d, lines: next };
-                            });
-                          }}
-                          placeholder="Tittel (påkrevd)"
-                          style={styles.input}
-                        />
+                        {isRun ? (
+                          <>
+                            <Text style={styles.fieldLabel}>Tittel</Text>
+                            <TextInput
+                              value={line.title}
+                              onChangeText={(t) => {
+                                setFormDraft((d) => {
+                                  const next = [...d.lines];
+                                  next[index] = { ...next[index], title: t };
+                                  return { ...d, lines: next };
+                                });
+                              }}
+                              placeholder="Tittel (påkrevd)"
+                              style={styles.input}
+                            />
+                          </>
+                        ) : null}
                         <View style={styles.field}>
                           <Text style={styles.fieldLabel}>Dato (valgfritt)</Text>
                           <Pressable
@@ -3540,10 +4413,39 @@ function RunningProgramTab({
                             <Text style={styles.dropdownChevron}>📅</Text>
                           </Pressable>
                         </View>
+                        <Text style={styles.fieldLabel}>Uke</Text>
+                        <Pressable
+                          onPress={() => {
+                            void Haptics.selectionAsync();
+                            setWeekPickerLineKey(line.key);
+                          }}
+                          style={styles.dropdownButton}
+                          accessibilityRole="button"
+                          accessibilityLabel="Velg uke for økten"
+                        >
+                          <Text style={styles.dropdownButtonText}>{`Uke ${lineWeekNum}`}</Text>
+                          <Text style={styles.dropdownChevron}>▾</Text>
+                        </Pressable>
+                        <Text style={styles.fieldLabel}>
+                          {isRun ? 'Beskrivelse (valgfritt)' : 'Notat (valgfritt)'}
+                        </Text>
+                        <TextInput
+                          value={line.description}
+                          onChangeText={(t) => {
+                            setFormDraft((d) => {
+                              const next = [...d.lines];
+                              next[index] = { ...next[index], description: t };
+                              return { ...d, lines: next };
+                            });
+                          }}
+                          placeholder={isRun ? 'Innhold i økten' : 'Fritekst utover øvelslisten'}
+                          style={[styles.input, styles.textarea]}
+                          multiline
+                        />
                         <View style={styles.field}>
                           <Text style={styles.fieldLabel}>Type økt</Text>
                           <View style={styles.optionGrid}>
-                            {runWorkoutTypeOptions.map((option) => {
+                            {workoutOptions.map((option) => {
                               const active = line.workoutType === option.value;
                               return (
                                 <Pressable
@@ -3553,19 +4455,23 @@ function RunningProgramTab({
                                     setFormDraft((d) => {
                                       const next = [...d.lines];
                                       const prev = next[index];
-                                      // Behold tittel hvis brukeren har skrevet noe eget;
-                                      // bare auto-fyll når feltet er tomt eller er igjen
-                                      // fra en tidligere type-valg.
+                                      // Løp: auto-fyll tittel når tomt/typetittel. Styrke: ingen økt-tittel.
                                       const prevWasAutoFilled =
                                         !prev.title.trim() ||
-                                        runWorkoutTypeOptions.some(
+                                        workoutOptions.some(
                                           (o) => o.value === prev.title.trim(),
                                         );
-                                      next[index] = {
-                                        ...prev,
-                                        workoutType: option.value,
-                                        title: prevWasAutoFilled ? option.value : prev.title,
-                                      };
+                                      next[index] = isRun
+                                        ? {
+                                            ...prev,
+                                            workoutType: option.value,
+                                            title: prevWasAutoFilled ? option.value : prev.title,
+                                          }
+                                        : {
+                                            ...prev,
+                                            workoutType: option.value,
+                                            title: '',
+                                          };
                                       return { ...d, lines: next };
                                     });
                                   }}
@@ -3587,56 +4493,425 @@ function RunningProgramTab({
                             })}
                           </View>
                         </View>
-                        <Text style={styles.fieldLabel}>Uke</Text>
-                        <Pressable
-                          onPress={() => {
-                            void Haptics.selectionAsync();
-                            setWeekPickerLineKey(line.key);
-                          }}
-                          style={styles.dropdownButton}
-                          accessibilityRole="button"
-                          accessibilityLabel="Velg uke for økten"
-                        >
-                          <Text style={styles.dropdownButtonText}>{`Uke ${lineWeekNum}`}</Text>
-                          <Text style={styles.dropdownChevron}>▾</Text>
-                        </Pressable>
-                        <Text style={styles.fieldLabel}>Beskrivelse (valgfritt)</Text>
-                        <TextInput
-                          value={line.description}
-                          onChangeText={(t) => {
-                            setFormDraft((d) => {
-                              const next = [...d.lines];
-                              next[index] = { ...next[index], description: t };
-                              return { ...d, lines: next };
-                            });
-                          }}
-                          placeholder="Innhold i økten"
-                          style={[styles.input, styles.textarea]}
-                          multiline
-                        />
+                        {!isRun ? (
+                          <View style={{ marginTop: 4, gap: 10 }}>
+                            {!line.strengthExercisesUIVisible ? (
+                              <Pressable
+                                onPress={() => {
+                                  void Haptics.selectionAsync();
+                                  setFormDraft((d) => {
+                                    const next = [...d.lines];
+                                    const curL = { ...next[index] };
+                                    curL.strengthExercisesUIVisible = true;
+                                    if (!curL.strengthExercises?.length) {
+                                      curL.strengthExercises = [emptyStrengthExercise()];
+                                    }
+                                    next[index] = curL;
+                                    return { ...d, lines: next };
+                                  });
+                                }}
+                                style={styles.programFormAddLineBtn}
+                                accessibilityRole="button"
+                                accessibilityLabel="Legg til øvelser for denne økten"
+                              >
+                                <Text style={styles.programFormAddLineBtnText}>Legg til øvelser</Text>
+                              </Pressable>
+                            ) : (
+                            <View style={{ gap: 12 }}>
+                            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                            <Text style={styles.fieldLabel}>Øvelser</Text>
+                            <Pressable
+                              onPress={() => {
+                                setFormDraft((d) => {
+                                  const next = [...d.lines];
+                                  const curL = { ...next[index] };
+                                  curL.strengthExercisesUIVisible = false;
+                                  next[index] = curL;
+                                  return { ...d, lines: next };
+                                });
+                              }}
+                            >
+                              <Text style={styles.muted}>Skjul</Text>
+                            </Pressable>
+                            </View>
+                            {(line.strengthExercises && line.strengthExercises.length
+                              ? line.strengthExercises
+                              : [emptyStrengthExercise()]
+                            ).map((ex, exIdx) => {
+                              const canSwipeExercise = (line.strengthExercises?.length || 0) > 1;
+                              const exerciseCard = (
+                              <View
+                                style={{
+                                  borderWidth: 1,
+                                  borderColor: '#e2e8f0',
+                                  borderRadius: 12,
+                                  padding: 12,
+                                  gap: 10,
+                                }}
+                              >
+                                <View>
+                                  <Text style={styles.fieldLabel}>Navn på øvelse</Text>
+                                  <TextInput
+                                    value={ex.name}
+                                    onChangeText={(t) => {
+                                      setFormDraft((d) => {
+                                        const next = [...d.lines];
+                                        const curL = { ...next[index] };
+                                        const exList = [
+                                          ...(curL.strengthExercises?.length
+                                            ? curL.strengthExercises
+                                            : [emptyStrengthExercise()]),
+                                        ];
+                                        exList[exIdx] = { ...exList[exIdx], name: t };
+                                        curL.strengthExercises = exList;
+                                        next[index] = curL;
+                                        return { ...d, lines: next };
+                                      });
+                                    }}
+                                    placeholder="Navn på øvelse"
+                                    style={styles.input}
+                                  />
+                                </View>
+                                <View style={styles.strengthSetTable}>
+                                  <View style={styles.strengthSetTableHeader}>
+                                    <Text style={[styles.strengthSetTableTh, styles.strengthSetTableThN]}>Sett</Text>
+                                    <Text style={[styles.strengthSetTableTh, styles.strengthSetTableThReps]}>
+                                      Reps
+                                    </Text>
+                                    <Text style={[styles.strengthSetTableTh, styles.strengthSetTableThLoad]}>
+                                      Tid/kg
+                                    </Text>
+                                    <View style={styles.strengthSetTableThKindSlot} />
+                                  </View>
+                                  {ex.setLines.map((row, setIdx) => {
+                                    const setRow = (
+                                    <View
+                                      style={[
+                                        styles.strengthSetTableRow,
+                                        setIdx > 0 ? styles.strengthSetTableRowSep : null,
+                                      ]}
+                                    >
+                                      <View style={styles.strengthSetTableCellN}>
+                                        <View style={styles.strengthSetNumCircle}>
+                                          <Text style={styles.strengthSetNumCircleText}>{setIdx + 1}</Text>
+                                        </View>
+                                      </View>
+                                      <View style={styles.strengthSetTableRepsCol}>
+                                        {row.loadKind === 'kg' ? (
+                                          <Pressable
+                                            onPress={() => {
+                                              void Haptics.selectionAsync();
+                                              setStrengthTimePickTarget(null);
+                                              setStrengthKgPickTarget(null);
+                                              setStrengthRepsPickTarget(`lr:${line.key}:${exIdx}:${setIdx}`);
+                                            }}
+                                            style={[
+                                              styles.dropdownButton,
+                                              styles.strengthSetTableValueFieldInner,
+                                              styles.strengthSetRepsNarrow,
+                                            ]}
+                                            accessibilityRole="button"
+                                            accessibilityLabel="Velg antall reps"
+                                          >
+                                            <Text
+                                              style={[
+                                                styles.dropdownButtonText,
+                                                !row.reps?.trim() && styles.dropdownButtonPlaceholder,
+                                              ]}
+                                            >
+                                              {row.reps?.trim() ? row.reps.trim() : '—'}
+                                            </Text>
+                                            <Text style={styles.dropdownChevron}>▾</Text>
+                                          </Pressable>
+                                        ) : (
+                                          <View style={styles.strengthSetTablePlaceholderCell}>
+                                            <Text style={styles.strengthSetTableDashCell}>—</Text>
+                                          </View>
+                                        )}
+                                      </View>
+                                      <View style={styles.strengthSetTableLoadValueRow}>
+                                        <View style={styles.strengthSetTableLoadValueWrap}>
+                                          {row.loadKind === 'kg' ? (
+                                            <Pressable
+                                              onPress={() => {
+                                                void Haptics.selectionAsync();
+                                                setStrengthTimePickTarget(null);
+                                                setStrengthRepsPickTarget(null);
+                                                setStrengthKgPickTarget(`lk:${line.key}:${exIdx}:${setIdx}`);
+                                              }}
+                                              style={[
+                                                styles.dropdownButton,
+                                                styles.strengthSetTableValueFieldInner,
+                                                styles.strengthSetTidValueBtn,
+                                              ]}
+                                              accessibilityRole="button"
+                                              accessibilityLabel="Velg vekt i kilo"
+                                            >
+                                              <Text
+                                                style={[
+                                                  styles.dropdownButtonText,
+                                                  { flex: 1, minWidth: 0 },
+                                                  !row.kg?.trim() && styles.dropdownButtonPlaceholder,
+                                                ]}
+                                                numberOfLines={1}
+                                              >
+                                                {row.kg?.trim() ? `${row.kg.trim()} kg` : 'kg'}
+                                              </Text>
+                                              <Text style={styles.dropdownChevron}>▾</Text>
+                                            </Pressable>
+                                          ) : (
+                                            <Pressable
+                                              onPress={() => {
+                                                void Haptics.selectionAsync();
+                                                setStrengthRepsPickTarget(null);
+                                                setStrengthKgPickTarget(null);
+                                                setStrengthTimePickTarget(`lt:${line.key}:${exIdx}:${setIdx}`);
+                                              }}
+                                              style={[
+                                                styles.dropdownButton,
+                                                styles.strengthSetTableValueFieldInner,
+                                                styles.strengthSetTidValueBtn,
+                                              ]}
+                                              accessibilityRole="button"
+                                              accessibilityLabel="Velg tid i minutter"
+                                            >
+                                              <Text
+                                                style={[
+                                                  styles.dropdownButtonText,
+                                                  { flex: 1, minWidth: 0 },
+                                                  !row.timeMinutes?.trim() && styles.dropdownButtonPlaceholder,
+                                                ]}
+                                                numberOfLines={1}
+                                              >
+                                                {row.timeMinutes?.trim()
+                                                  ? `${row.timeMinutes.trim()} min`
+                                                  : 'Tid'}
+                                              </Text>
+                                              <Text style={styles.dropdownChevron}>▾</Text>
+                                            </Pressable>
+                                          )}
+                                        </View>
+                                        <View style={styles.strengthSetKindIconRow}>
+                                          <Pressable
+                                            onPress={() => {
+                                              void Haptics.selectionAsync();
+                                              if (row.loadKind === 'kg') return;
+                                              setStrengthTimePickTarget(null);
+                                              setFormDraft((d) => {
+                                                const next = [...d.lines];
+                                                const curL = { ...next[index] };
+                                                const exList = [
+                                                  ...(curL.strengthExercises?.length
+                                                    ? curL.strengthExercises
+                                                    : [emptyStrengthExercise()]),
+                                                ];
+                                                const lines = [...exList[exIdx].setLines];
+                                                const prev = lines[setIdx];
+                                                lines[setIdx] = {
+                                                  ...prev,
+                                                  loadKind: 'kg',
+                                                  timeMinutes: '',
+                                                };
+                                                exList[exIdx] = { ...exList[exIdx], setLines: lines };
+                                                curL.strengthExercises = exList;
+                                                next[index] = curL;
+                                                return { ...d, lines: next };
+                                              });
+                                            }}
+                                            style={({ pressed }) => [
+                                              styles.strengthSetKindIcon,
+                                              row.loadKind === 'kg' ? styles.strengthSetKindIconOn : styles.strengthSetKindIconOff,
+                                              pressed && { opacity: 0.75 },
+                                            ]}
+                                            accessibilityRole="button"
+                                            accessibilityState={{ selected: row.loadKind === 'kg' }}
+                                            accessibilityLabel="Belastning i kilo"
+                                          >
+                                            <FontAwesome6
+                                              name="dumbbell"
+                                              size={12}
+                                              solid
+                                              color={row.loadKind === 'kg' ? '#7A3C4A' : '#94a3b8'}
+                                            />
+                                          </Pressable>
+                                          <Pressable
+                                            onPress={() => {
+                                              void Haptics.selectionAsync();
+                                              if (row.loadKind === 'time') return;
+                                              setStrengthKgPickTarget(null);
+                                              setFormDraft((d) => {
+                                                const next = [...d.lines];
+                                                const curL = { ...next[index] };
+                                                const exList = [
+                                                  ...(curL.strengthExercises?.length
+                                                    ? curL.strengthExercises
+                                                    : [emptyStrengthExercise()]),
+                                                ];
+                                                const lines = [...exList[exIdx].setLines];
+                                                const prev = lines[setIdx];
+                                                lines[setIdx] = {
+                                                  ...prev,
+                                                  loadKind: 'time',
+                                                  kg: '',
+                                                  timeMinutes: prev.timeMinutes?.trim() ? prev.timeMinutes : '1',
+                                                };
+                                                exList[exIdx] = { ...exList[exIdx], setLines: lines };
+                                                curL.strengthExercises = exList;
+                                                next[index] = curL;
+                                                return { ...d, lines: next };
+                                              });
+                                            }}
+                                            style={({ pressed }) => [
+                                              styles.strengthSetKindIcon,
+                                              row.loadKind === 'time' ? styles.strengthSetKindIconOn : styles.strengthSetKindIconOff,
+                                              pressed && { opacity: 0.75 },
+                                            ]}
+                                            accessibilityRole="button"
+                                            accessibilityState={{ selected: row.loadKind === 'time' }}
+                                            accessibilityLabel="Belastning i minutter"
+                                          >
+                                            <FontAwesome6
+                                              name="stopwatch"
+                                              size={12}
+                                              solid
+                                              color={row.loadKind === 'time' ? '#7A3C4A' : '#94a3b8'}
+                                            />
+                                          </Pressable>
+                                        </View>
+                                      </View>
+                                    </View>
+                                    );
+                                    const canSwipeRemove = ex.setLines.length > 1;
+                                    if (canSwipeRemove) {
+                                      return (
+                                        <SwipeToDelete
+                                          key={`${ex.key}-set-${setIdx}`}
+                                          onDelete={() => {
+                                            setStrengthTimePickTarget((t) =>
+                                              adjustStrengthTimePickTargetAfterRemove(t, line.key, exIdx, setIdx),
+                                            );
+                                            setStrengthRepsPickTarget((t) =>
+                                              adjustStrengthRepsPickTargetAfterRemove(t, line.key, exIdx, setIdx),
+                                            );
+                                            setStrengthKgPickTarget((t) =>
+                                              adjustStrengthKgPickTargetAfterRemove(t, line.key, exIdx, setIdx),
+                                            );
+                                            setFormDraft((d) => {
+                                              const next = [...d.lines];
+                                              const curL = { ...next[index] };
+                                              const exList = [
+                                                ...(curL.strengthExercises?.length
+                                                  ? curL.strengthExercises
+                                                  : [emptyStrengthExercise()]),
+                                              ];
+                                              exList[exIdx] = removeStrengthSetAt(exList[exIdx], setIdx);
+                                              curL.strengthExercises = exList;
+                                              next[index] = curL;
+                                              return { ...d, lines: next };
+                                            });
+                                          }}
+                                          confirmTitle="Fjerne sett?"
+                                          confirmMessage="Dette settet fjernes fra øvelsen."
+                                        >
+                                          {setRow}
+                                        </SwipeToDelete>
+                                      );
+                                    }
+                                    return <View key={`${ex.key}-set-${setIdx}`}>{setRow}</View>;
+                                  })}
+                                </View>
+                                <Pressable
+                                  onPress={() => {
+                                    if (ex.setLines.length >= MAX_STRENGTH_SET_LINES) return;
+                                    void Haptics.selectionAsync();
+                                    setFormDraft((d) => {
+                                      const next = [...d.lines];
+                                      const curL = { ...next[index] };
+                                      const exList = [
+                                        ...(curL.strengthExercises?.length
+                                          ? curL.strengthExercises
+                                          : [emptyStrengthExercise()]),
+                                      ];
+                                      exList[exIdx] = addStrengthSetToExercise(exList[exIdx]);
+                                      curL.strengthExercises = exList;
+                                      next[index] = curL;
+                                      return { ...d, lines: next };
+                                    });
+                                  }}
+                                  disabled={ex.setLines.length >= MAX_STRENGTH_SET_LINES}
+                                  style={({ pressed }) => [
+                                    styles.programFormAddLineBtn,
+                                    ex.setLines.length >= MAX_STRENGTH_SET_LINES && { opacity: 0.45 },
+                                    pressed && ex.setLines.length < MAX_STRENGTH_SET_LINES && { opacity: 0.85 },
+                                  ]}
+                                  accessibilityRole="button"
+                                  accessibilityLabel="Legg til et sett for denne øvelsen"
+                                  accessibilityState={{ disabled: ex.setLines.length >= MAX_STRENGTH_SET_LINES }}
+                                >
+                                  <Text style={styles.programFormAddLineBtnText}>+ Legg til sett</Text>
+                                </Pressable>
+                              </View>
+                              );
+                              if (canSwipeExercise) {
+                                return (
+                                  <SwipeToDelete
+                                    key={ex.key}
+                                    onDelete={() => {
+                                      setStrengthTimePickTarget(null);
+                                      setStrengthRepsPickTarget(null);
+                                      setStrengthKgPickTarget(null);
+                                      setFormDraft((d) => {
+                                        const next = [...d.lines];
+                                        const curL = { ...next[index] };
+                                        const exList = (curL.strengthExercises || [emptyStrengthExercise()]).filter(
+                                          (_, j) => j !== exIdx,
+                                        );
+                                        curL.strengthExercises = exList.length ? exList : [emptyStrengthExercise()];
+                                        next[index] = curL;
+                                        return { ...d, lines: next };
+                                      });
+                                    }}
+                                    confirmTitle="Fjerne øvelse?"
+                                    confirmMessage="Øvelsen fjernes fra denne økten."
+                                  >
+                                    {exerciseCard}
+                                  </SwipeToDelete>
+                                );
+                              }
+                              return <View key={ex.key}>{exerciseCard}</View>;
+                            })}
+                            <Pressable
+                              onPress={() => {
+                                void Haptics.selectionAsync();
+                                setFormDraft((d) => {
+                                  const next = [...d.lines];
+                                  const curL = { ...next[index] };
+                                  const exList = [
+                                    ...(curL.strengthExercises?.length
+                                      ? curL.strengthExercises
+                                      : [emptyStrengthExercise()]),
+                                    emptyStrengthExercise(),
+                                  ];
+                                  curL.strengthExercises = exList;
+                                  next[index] = curL;
+                                  return { ...d, lines: next };
+                                });
+                              }}
+                              style={styles.programFormAddLineBtn}
+                              accessibilityRole="button"
+                              accessibilityLabel="Legg til øvelse i denne økten"
+                            >
+                              <Text style={styles.programFormAddLineBtnText}>+ Legg til øvelse</Text>
+                            </Pressable>
+                            </View>
+                            )}
+                          </View>
+                        ) : null}
                       </View>
                     ) : null}
                   </View>
                 );
-                            return canDeleteLine ? (
-                              <SwipeToDelete
-                                key={line.key}
-                                onDelete={() =>
-                                  setFormDraft((d) => ({
-                                    ...d,
-                                    lines: d.lines.filter((_, i) => i !== index),
-                                  }))
-                                }
-                                confirmTitle="Slett økt?"
-                                confirmMessage={`"${
-                                  line.title.trim() || 'Økt'
-                                }" fjernes fra programmet.`}
-                              >
-                                {cardContent}
-                              </SwipeToDelete>
-                            ) : (
-                              <View key={line.key}>{cardContent}</View>
-                            );
+                            return <View key={line.key}>{cardContent}</View>;
                           })}
                           <Pressable
                             onPress={() => {
@@ -3660,6 +4935,8 @@ function RunningProgramTab({
                                       date: '',
                                       done: false,
                                       workoutType: '',
+                                      strengthExercises: undefined,
+                                      strengthExercisesUIVisible: false,
                                     },
                                   ],
                                 };
@@ -3680,7 +4957,11 @@ function RunningProgramTab({
 
               <Pressable onPress={submitProgramForm} style={[styles.primaryButtonFull, { marginTop: 16 }]}>
                 <Text style={styles.primaryButtonText}>
-                  {formDraft.mode === 'edit' ? 'Lagre' : 'Opprett løpeprogram'}
+                  {formDraft.mode === 'edit'
+                    ? 'Lagre'
+                    : isRun
+                      ? 'Opprett løpeprogram'
+                      : 'Opprett styrkeprogram'}
                 </Text>
               </Pressable>
             </ScrollView>
@@ -3929,7 +5210,343 @@ function RunningProgramTab({
               </View>
             </View>
           </Modal>
+
+          <Modal
+            visible={strengthTimePickTarget != null}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setStrengthTimePickTarget(null)}
+          >
+            <View style={styles.dropdownBackdrop}>
+              <Pressable style={StyleSheet.absoluteFill} onPress={() => setStrengthTimePickTarget(null)} />
+              <View style={styles.dropdownSheet}>
+                <Text style={styles.dropdownSheetTitle}>Minutter (tid)</Text>
+                {strengthTimePickTarget != null
+                  ? (() => {
+                      const ctx = parseStrengthTimePickerTarget(strengthTimePickTarget);
+                      if (!ctx) return null;
+                      const line = formDraft.lines.find((l) => l.key === ctx.lineKey);
+                      const ex = line?.strengthExercises?.[ctx.exIdx];
+                      const row = ex?.setLines[ctx.setIdx];
+                      const minIdx = row?.timeMinutes
+                        ? parseStrengthTimeMinutesIndex(row.timeMinutes)
+                        : 0;
+                      const timeVisible = 3;
+                      const timeSelBottom = (WHEEL_ITEM_HEIGHT * timeVisible) / 2 - WHEEL_ITEM_HEIGHT / 2;
+                      return (
+                        <View style={[styles.wheelContainer, { paddingVertical: 0 }]}>
+                          <View
+                            pointerEvents="none"
+                            style={[styles.wheelSelectionBar, { bottom: timeSelBottom }]}
+                          />
+                          <View style={[styles.wheelColumn, { flex: 1 }]}>
+                            <WheelPicker
+                              count={STRENGTH_TIME_MAX_MIN}
+                              value={minIdx}
+                              onChange={(idx) => {
+                                const m = idx + 1;
+                                setFormDraft((d) => {
+                                  const next = d.lines.map((l) => {
+                                    if (l.key !== ctx.lineKey) return l;
+                                    const exList = [
+                                      ...(l.strengthExercises?.length
+                                        ? l.strengthExercises
+                                        : [emptyStrengthExercise()]),
+                                    ];
+                                    const copyEx = { ...exList[ctx.exIdx] };
+                                    const setLines = [...copyEx.setLines];
+                                    setLines[ctx.setIdx] = {
+                                      ...setLines[ctx.setIdx],
+                                      loadKind: 'time',
+                                      timeMinutes: String(m),
+                                      kg: '',
+                                    };
+                                    copyEx.setLines = setLines;
+                                    exList[ctx.exIdx] = copyEx;
+                                    return { ...l, strengthExercises: exList };
+                                  });
+                                  return { ...d, lines: next };
+                                });
+                              }}
+                              formatItem={(i) => `${i + 1} min`}
+                              visibleCount={timeVisible}
+                            />
+                          </View>
+                        </View>
+                      );
+                    })()
+                  : null}
+                <Pressable
+                  onPress={() => setStrengthTimePickTarget(null)}
+                  style={[styles.pinkButtonFull, { marginTop: 12 }]}
+                >
+                  <Text style={styles.pinkButtonText}>Ferdig</Text>
+                </Pressable>
+              </View>
+            </View>
+          </Modal>
+
+          <Modal
+            visible={strengthRepsPickTarget != null}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setStrengthRepsPickTarget(null)}
+          >
+            <View style={styles.dropdownBackdrop}>
+              <Pressable style={StyleSheet.absoluteFill} onPress={() => setStrengthRepsPickTarget(null)} />
+              <View style={styles.dropdownSheet}>
+                <Text style={styles.dropdownSheetTitle}>Reps</Text>
+                {strengthRepsPickTarget != null
+                  ? (() => {
+                      const ctx = parseStrengthRepsPickerTarget(strengthRepsPickTarget);
+                      if (!ctx) return null;
+                      const wLine = formDraft.lines.find((l) => l.key === ctx.lineKey);
+                      const wEx = wLine?.strengthExercises?.[ctx.exIdx];
+                      const wRow = wEx?.setLines[ctx.setIdx];
+                      const repsIdx = wRow ? parseStrengthRepsWheelIndex(wRow.reps) : 0;
+                      const repsVisible = 3;
+                      const repsSelBottom = (WHEEL_ITEM_HEIGHT * repsVisible) / 2 - WHEEL_ITEM_HEIGHT / 2;
+                      return (
+                        <View style={[styles.wheelContainer, { paddingVertical: 0 }]}>
+                          <View
+                            pointerEvents="none"
+                            style={[styles.wheelSelectionBar, { bottom: repsSelBottom }]}
+                          />
+                          <View style={[styles.wheelColumn, { flex: 1 }]}>
+                            <WheelPicker
+                              count={STRENGTH_REPS_MAX}
+                              value={repsIdx}
+                              onChange={(idx) => {
+                                const n = String(idx + 1);
+                                setFormDraft((d) => {
+                                  const next = d.lines.map((l) => {
+                                    if (l.key !== ctx.lineKey) return l;
+                                    const exList = [
+                                      ...(l.strengthExercises?.length
+                                        ? l.strengthExercises
+                                        : [emptyStrengthExercise()]),
+                                    ];
+                                    const copyEx = { ...exList[ctx.exIdx] };
+                                    const setLines = [...copyEx.setLines];
+                                    setLines[ctx.setIdx] = {
+                                      ...setLines[ctx.setIdx],
+                                      reps: n,
+                                    };
+                                    copyEx.setLines = setLines;
+                                    exList[ctx.exIdx] = copyEx;
+                                    return { ...l, strengthExercises: exList };
+                                  });
+                                  return { ...d, lines: next };
+                                });
+                              }}
+                              formatItem={(i) => String(i + 1)}
+                              visibleCount={repsVisible}
+                            />
+                          </View>
+                        </View>
+                      );
+                    })()
+                  : null}
+                <Pressable
+                  onPress={() => setStrengthRepsPickTarget(null)}
+                  style={[styles.pinkButtonFull, { marginTop: 12 }]}
+                >
+                  <Text style={styles.pinkButtonText}>Ferdig</Text>
+                </Pressable>
+              </View>
+            </View>
+          </Modal>
+
+          <Modal
+            visible={strengthKgPickTarget != null}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setStrengthKgPickTarget(null)}
+          >
+            <View style={styles.dropdownBackdrop}>
+              <Pressable style={StyleSheet.absoluteFill} onPress={() => setStrengthKgPickTarget(null)} />
+              <View style={styles.dropdownSheet}>
+                <Text style={styles.dropdownSheetTitle}>Kilo (kg)</Text>
+                {strengthKgPickTarget != null
+                  ? (() => {
+                      const ctx = parseStrengthKgPickerTarget(strengthKgPickTarget);
+                      if (!ctx) return null;
+                      const kLine = formDraft.lines.find((l) => l.key === ctx.lineKey);
+                      const kEx = kLine?.strengthExercises?.[ctx.exIdx];
+                      const kRow = kEx?.setLines[ctx.setIdx];
+                      const kgIdx = kRow ? parseStrengthKgWheelIndex(kRow.kg) : 0;
+                      const kgVisible = 3;
+                      const kgSelBottom = (WHEEL_ITEM_HEIGHT * kgVisible) / 2 - WHEEL_ITEM_HEIGHT / 2;
+                      return (
+                        <View style={[styles.wheelContainer, { paddingVertical: 0 }]}>
+                          <View
+                            pointerEvents="none"
+                            style={[styles.wheelSelectionBar, { bottom: kgSelBottom }]}
+                          />
+                          <View style={[styles.wheelColumn, { flex: 1 }]}>
+                            <WheelPicker
+                              count={STRENGTH_KG_COUNT}
+                              value={kgIdx}
+                              onChange={(idx) => {
+                                const kgStr = String(idx);
+                                setFormDraft((d) => {
+                                  const next = d.lines.map((l) => {
+                                    if (l.key !== ctx.lineKey) return l;
+                                    const exList = [
+                                      ...(l.strengthExercises?.length
+                                        ? l.strengthExercises
+                                        : [emptyStrengthExercise()]),
+                                    ];
+                                    const copyEx = { ...exList[ctx.exIdx] };
+                                    const setLines = [...copyEx.setLines];
+                                    setLines[ctx.setIdx] = {
+                                      ...setLines[ctx.setIdx],
+                                      loadKind: 'kg',
+                                      kg: kgStr,
+                                      timeMinutes: '',
+                                    };
+                                    copyEx.setLines = setLines;
+                                    exList[ctx.exIdx] = copyEx;
+                                    return { ...l, strengthExercises: exList };
+                                  });
+                                  return { ...d, lines: next };
+                                });
+                              }}
+                              formatItem={(i) => `${i} kg`}
+                              visibleCount={kgVisible}
+                            />
+                          </View>
+                        </View>
+                      );
+                    })()
+                  : null}
+                <Pressable
+                  onPress={() => setStrengthKgPickTarget(null)}
+                  style={[styles.pinkButtonFull, { marginTop: 12 }]}
+                >
+                  <Text style={styles.pinkButtonText}>Ferdig</Text>
+                </Pressable>
+              </View>
+            </View>
+          </Modal>
         </SafeAreaView>
+      </Modal>
+
+      <Modal
+        visible={!isRun && checklistLogPick != null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setChecklistLogPick(null)}
+      >
+        <View style={styles.dropdownBackdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setChecklistLogPick(null)} />
+          <View style={styles.dropdownSheet}>
+            <Text style={styles.dropdownSheetTitle}>
+              {checklistLogPick?.field === 'reps'
+                ? 'Reps'
+                : checklistLogPick?.field === 'kg'
+                  ? 'Kilo (kg)'
+                  : 'Minutter (tid)'}
+            </Text>
+            {checklistLogPick && onPatchStrengthSet
+              ? (() => {
+                  const pick = checklistLogPick;
+                  const s = getChecklistProgramStrengthSet(
+                    pick.programId,
+                    pick.itemId,
+                    pick.exIdx,
+                    pick.setIdx,
+                  );
+                  if (!s) return null;
+                  const isSetTime =
+                    s.loadKind === 'time' || (!!s.timeMinutes?.trim() && s.loadKind !== 'kg');
+                  const visibleC = 3;
+                  const selBottom = (WHEEL_ITEM_HEIGHT * visibleC) / 2 - WHEEL_ITEM_HEIGHT / 2;
+                  if (pick.field === 'reps') {
+                    const rIdx = parseStrengthRepsWheelIndex(strengthSetDisplayReps(s));
+                    return (
+                      <View style={[styles.wheelContainer, { paddingVertical: 0 }]}>
+                        <View
+                          pointerEvents="none"
+                          style={[styles.wheelSelectionBar, { bottom: selBottom }]}
+                        />
+                        <View style={[styles.wheelColumn, { flex: 1 }]}>
+                          <WheelPicker
+                            count={STRENGTH_REPS_MAX}
+                            value={rIdx}
+                            onChange={(idx) => {
+                              onPatchStrengthSet(pick.programId, pick.itemId, pick.exIdx, pick.setIdx, {
+                                actualReps: String(idx + 1),
+                              });
+                            }}
+                            formatItem={(i) => String(i + 1)}
+                            visibleCount={visibleC}
+                          />
+                        </View>
+                      </View>
+                    );
+                  }
+                  if (pick.field === 'kg' && !isSetTime) {
+                    const dLoad = strengthSetDisplayLoad(s);
+                    const kIdx = parseStrengthKgWheelIndex(dLoad.kind === 'kg' ? dLoad.text : '0');
+                    return (
+                      <View style={[styles.wheelContainer, { paddingVertical: 0 }]}>
+                        <View
+                          pointerEvents="none"
+                          style={[styles.wheelSelectionBar, { bottom: selBottom }]}
+                        />
+                        <View style={[styles.wheelColumn, { flex: 1 }]}>
+                          <WheelPicker
+                            count={STRENGTH_KG_COUNT}
+                            value={kIdx}
+                            onChange={(idx) => {
+                              onPatchStrengthSet(pick.programId, pick.itemId, pick.exIdx, pick.setIdx, {
+                                actualWeightKg: String(idx),
+                              });
+                            }}
+                            formatItem={(i) => `${i} kg`}
+                            visibleCount={visibleC}
+                          />
+                        </View>
+                      </View>
+                    );
+                  }
+                  if (pick.field === 'time' && isSetTime) {
+                    const tIdx = parseStrengthTimeMinutesIndex(strengthSetDisplayLoad(s).text);
+                    return (
+                      <View style={[styles.wheelContainer, { paddingVertical: 0 }]}>
+                        <View
+                          pointerEvents="none"
+                          style={[styles.wheelSelectionBar, { bottom: selBottom }]}
+                        />
+                        <View style={[styles.wheelColumn, { flex: 1 }]}>
+                          <WheelPicker
+                            count={STRENGTH_TIME_MAX_MIN}
+                            value={tIdx}
+                            onChange={(idx) => {
+                              const m = String(idx + 1);
+                              onPatchStrengthSet(pick.programId, pick.itemId, pick.exIdx, pick.setIdx, {
+                                actualTimeMinutes: m,
+                              });
+                            }}
+                            formatItem={(i) => `${i + 1} min`}
+                            visibleCount={visibleC}
+                          />
+                        </View>
+                      </View>
+                    );
+                  }
+                  return null;
+                })()
+              : null}
+            <Pressable
+              onPress={() => setChecklistLogPick(null)}
+              style={[styles.pinkButtonFull, { marginTop: 12 }]}
+            >
+              <Text style={styles.pinkButtonText}>Ferdig</Text>
+            </Pressable>
+          </View>
+        </View>
       </Modal>
     </>
   );
@@ -3957,11 +5574,15 @@ const ChatTab = React.forwardRef<
   ChatTabHandle,
   {
     onSaveRunningProgram: (payload: RunningProgramPayload) => void;
-    onAfterProgramSaved?: () => void;
+    onSaveStrengthProgram: (payload: StrengthProgramPayload) => void;
+    onAfterProgramSaved?: (kind: ProgramSubTab) => void;
     onCompetitionFollowupPosted?: () => void;
     runningPrograms: SavedRunningProgram[];
   }
->(function ChatTab({ onSaveRunningProgram, onAfterProgramSaved, onCompetitionFollowupPosted, runningPrograms }, ref) {
+>(function ChatTab(
+  { onSaveRunningProgram, onSaveStrengthProgram, onAfterProgramSaved, onCompetitionFollowupPosted, runningPrograms },
+  ref,
+) {
   const userId = useUserId();
   const chatStorageKey = userKey(CHAT_STORAGE_KEY, userId);
   const competitionFollowupKey = userKey(COMPETITION_FOLLOWUP_KEY, userId);
@@ -4016,7 +5637,7 @@ const ChatTab = React.forwardRef<
             id: String(Date.now()),
             role: 'assistant',
             text:
-              'Hei! Jeg er din personlige trener. Jeg kan svare på spørsmål om løping og trening, lage løpeprogrammer du kan lagre som sjekkliste under fanen Løpeprogram, og hente oversikt fra Strava når det er koblet til. Hva lurer du på i dag?',
+              'Hei! Jeg er din personlige trener. Jeg kan svare på spørsmål om løping og styrke, lage løpe- og styrkeprogrammer du kan lagre som sjekkliste (Program-fanen), og hente oversikt fra Strava når det er koblet til. Hva lurer du på i dag?',
             createdAt: Date.now(),
           },
         ]);
@@ -4047,7 +5668,7 @@ const ChatTab = React.forwardRef<
             id: `${Date.now()}-welcome`,
             role: 'assistant',
             text:
-              'Hei! Jeg er din personlige trener. Jeg kan svare på spørsmål om løping og trening, lage løpeprogrammer du kan lagre som sjekkliste under fanen Løpeprogram, og hente oversikt fra Strava når det er koblet til. Hva lurer du på i dag?',
+              'Hei! Jeg er din personlige trener. Jeg kan svare på spørsmål om løping og styrke, lage løpe- og styrkeprogrammer du kan lagre som sjekkliste (Program-fanen), og hente oversikt fra Strava når det er koblet til. Hva lurer du på i dag?',
             createdAt: Date.now(),
           },
         ]);
@@ -4176,8 +5797,11 @@ const ChatTab = React.forwardRef<
 
     try {
       const baseCoachSystem =
-        'Du er en personlig treningsrådgiver (PRT) for en løper som også driver med styrketrening. Brukeren driver KUN med løping og styrke – ikke triatlon, sykling eller svømming. Ikke foreslå sykkel-, svømme- eller triatlonøkter. Svar på spørsmål om trening, løping, styrke, restitusjon, pulssoner og planlegging. Når brukeren ber om et løpeprogram over flere uker (eller har et tydelig tidsbegrenset mål), kaller du verktøyet create_running_program slik at øktene kan lagres som sjekkliste i appen. Verktøyet create_running_program inneholder bare løpeøkter: for hver økt er workout_type allerede én av «Rolig løpetur», «Terkeløkt», «Intervaller», «Konkurranse», og feltet description skal kun beskrive selve løpeøkta (distanse, varighet, intensitet, puls, drag, terreng). Ikke skriv styrke, core, knebøy, gym, vekter eller «etter løpetur + styrke» i noen description — det hører ikke hjemme i løpesjekklisten. Vil du anbefale styrke ved siden av, gjør det i det vanlige chat-svaret, ikke i verktøyets sessions. Viktig: antall økter per uke (f.eks. «fire økter i uken», «4 økter») er **ikke** verktøyfeltet weeks — weeks er kun antall **uker** programmet skal vare. Bruk aldri tallet for økter/uke som weeks. Når brukeren i chatten oppgir konkurranse eller dato (f.eks. «10. juni», «konkurransedag 10. juni»), skal main_race_date og main_race_name i create_running_program alltid bygge på det brukeren **sier i samtalen nå** — ikke på eldre konkurranser som bare står lagret i listen fra fanen Løpeprogram. Når brukeren har et hovedløp eller oppgitt konkurranse, fyll valgfrie feltene main_race_name og main_race_date (YYYY-MM-DD) i create_running_program slik at appen og du husker datoen. Når brukeren ber om program **frem til** konkurransedato (ikke bare «siste N uker før»), skal weeks være nøyaktig antall uker fra i dag (Europe/Oslo) til og med uken som inneholder main_race_date — ikke et kortere antall fordi du gjettet feil. Når main_race_date er satt, skal feltet weeks og alle økters week aldri overskride antall uker frem til konkurransen (programmet skal ikke fortsette etter konkurranseuken). For create_running_program: klassifiser hver planlagte løpeøkt med nøyaktig én workout_type blant de fire som i appen ved manuell løpelogging: «Rolig løpetur», «Terkeløkt», «Intervaller», «Konkurranse». Velg typen ut fra øktens hovedformål (varig rolig grunnlag, terskel/tempo, intervaller, eller konkurranse/test). I create_running_program må sessions inneholde hele blokken: minst én økt per uke for hver uke fra 1 til weeks (vanligvis 3–6 økter per uke), ikke bare de første par ukene. Når main_race_date er satt: fyll session_date (YYYY-MM-DD) på hver økt slik at datoene følger ekte kalender og ukedag i day_label; økta med «Konkurranse» skal ha session_date lik main_race_date. workout_type blir øktens tittel i sjekklisten; skriv konkrete løpedetaljer kun i description. For korte ukeplaner (noen dager) kan create_workout_plan brukes. Strava-data kan hentes med get_training_summary når det er relevant. Etter et verktøykall: oppsummer resultatet kort og vennlig for brukeren (3–7 punkter ved plan), uten å sitere rå JSON eller interne feltnavn. Vær konkret og basert på treningslære. Bruk norsk, vær varm og motiverende, men hold svarene korte og presise.';
+        'Du er en personlig treningsrådgiver (PRT) for en løper som også driver med styrketrening. Brukeren driver KUN med løping og styrke – ikke triatlon, sykling eller svømming. Ikke foreslå sykkel-, svømme- eller triatlonøkter. Svar på spørsmål om trening, løping, styrke, restitusjon, pulssoner og planlegging. Når brukeren ber om et løpeprogram over flere uker (eller har et tydelig tidsbegrenset mål), kaller du verktøyet create_running_program slik at øktene kan lagres som sjekkliste i appen. Verktøyet create_running_program inneholder bare løpeøkter: for hver økt er workout_type allerede én av «Rolig løpetur», «Terkeløkt», «Intervaller», «Konkurranse», og feltet description skal kun beskrive selve løpeøkta (distanse, varighet, intensitet, puls, drag, terreng). Ikke skriv styrke, core, knebøy, gym, vekter eller «etter løpetur + styrke» i noen description — det hører ikke hjemme i løpesjekklisten. Når brukeren ber om et styrkeprogram over flere uker, kaller du create_strength_program: for hver økt er session_type nøyaktig én av «Fullkropp», «Bein», «Overkropp», «HIIT», «Skadeforebyggende» (samme som manuell styrkelogging), og description beskriver bare styrkeinnhold. Ikke legg rene løpeøkter i create_strength_program; bruk create_running_program for løping. sessions i create_strength_program skal, som for løping, fylle hele perioden 1..weeks med minst én økt per uke. Vil du anbefale styrke ved siden av, gjør det i det vanlige chat-svaret, ikke i løpe-sjekklistens verktøy. Viktig: antall økter per uke (f.eks. «fire økter i uken», «4 økter») er **ikke** verktøyfeltet weeks — weeks er kun antall **uker** programmet skal vare. Bruk aldri tallet for økter/uke som weeks. Når brukeren i chatten oppgir konkurranse eller dato (f.eks. «10. juni», «konkurransedag 10. juni»), skal main_race_date og main_race_name i create_running_program alltid bygge på det brukeren **sier i samtalen nå** — ikke på eldre konkurranser som bare står lagret i listen i Program (Løpeprogram). Når brukeren har et hovedløp eller oppgitt konkurranse, fyll valgfrie feltene main_race_name og main_race_date (YYYY-MM-DD) i create_running_program slik at appen og du husker datoen. Når brukeren ber om program **frem til** konkurransedato (ikke bare «siste N uker før»), skal weeks være nøyaktig antall uker fra i dag (Europe/Oslo) til og med uken som inneholder main_race_date — ikke et kortere antall fordi du gjettet feil. Når main_race_date er satt, skal feltet weeks og alle økters week aldri overskride antall uker frem til konkurransen (programmet skal ikke fortsette etter konkurranseuken). For create_running_program: klassifiser hver planlagte løpeøkt med nøyaktig én workout_type blant de fire som i appen ved manuell løpelogging: «Rolig løpetur», «Terkeløkt», «Intervaller», «Konkurranse». Velg typen ut fra øktens hovedformål (varig rolig grunnlag, terskel/tempo, intervaller, eller konkurranse/test). I create_running_program må sessions inneholde hele blokken: minst én økt per uke for hver uke fra 1 til weeks (vanligvis 3–6 økter per uke), ikke bare de første par ukene. Når main_race_date er satt: fyll session_date (YYYY-MM-DD) på hver økt slik at datoene følger ekte kalender og ukedag i day_label; økta med «Konkurranse» skal ha session_date lik main_race_date. workout_type blir øktens tittel i sjekklisten; skriv konkrete løpedetaljer kun i description. For korte ukeplaner (noen dager) kan create_workout_plan brukes. Strava-data kan hentes med get_training_summary når det er relevant. Etter et verktøykall: oppsummer resultatet kort og vennlig for brukeren (3–7 punkter ved plan), uten å sitere rå JSON eller interne feltnavn. Vær konkret og basert på treningslære. Bruk norsk, vær varm og motiverende, men hold svarene korte og presise.';
       const raceFromMessage = extractStatedCompetitionYmdFromText(text);
+      const userWantsStrength = wantsStrengthProgramIntent(text);
+      const userWantsRunning = wantsRunningProgramIntent(text);
+      const programKindAmbiguous = wantsProgramKindAmbiguous(text);
       const wantsFullSpanToRace =
         !!raceFromMessage &&
         /\bfrem\s+til\b|\btil\s+konkurranse|\bkonkurransedag\b|\bkonkurransedato\b|\bmot\s+konkurranse\b|\bprogram\s+frem\b/i.test(
@@ -4187,15 +5811,34 @@ const ChatTab = React.forwardRef<
         raceFromMessage && wantsFullSpanToRace
           ? maxProgramWeeksThroughRaceDateOslo(raceFromMessage.ymd)
           : null;
-      const racePriorityBlock = raceFromMessage
-        ? `\n\nPRIORITET (siste brukermelding): Konkurranse med dato ${raceFromMessage.human} — sett main_race_date=${raceFromMessage.ymd} i create_running_program når du lager program mot dette løpet (og passende main_race_name hvis brukeren nevnte navn). Bruk ikke en annen dato fra listen over lagrede løpeprogram.${
+      /** Når true: ikke lenke konkurranse-dato i styrkespørsmål til løpeverktøy (årsak til feil verktøy). */
+      const racePriorityForRunningOnly = !!raceFromMessage && !userWantsStrength;
+      const racePriorityBlock = racePriorityForRunningOnly
+        ? `\n\nPRIORITET (siste brukermelding): Konkurranse med dato ${raceFromMessage.human} — sett main_race_date=${raceFromMessage.ymd} i create_running_program når du lager program mot dette løpet (og passende main_race_name hvis brukeren nevnte navn). Bruk ikke en annen dato fra listen over lagrede løpeprogram (Program – Løpeprogram).${
             weeksCap != null
               ? ` Brukeren vil dekke hele løpet frem til denne datoen: sett weeks=${weeksCap} (antall uker fra i dag Oslo til og med konkurranseuken, ikke antall økter per uke) og fyll alle uke 1..${weeksCap} med økter.`
               : ''
           }`
         : '';
-      const coachSystem = `${baseCoachSystem}${buildCompetitionCoachContext(runningPrograms)}${racePriorityBlock}`;
-      const payload = {
+      const strengthToolPriorityBlock = userWantsStrength
+        ? userWantsRunning
+          ? '\n\nBrukeren har nevnt både løp og styrke i siste melding. Velg nøyaktig ett verktøy: create_strength_program hvis fokus er styrke/gym, create_running_program hvis fokus er løping. Ikke kall løpeverktøy for et rent styrkeønske, og ikke fyll løpeøkter i styrkeverktøyet — forklar gjerne den andre delen i vanlige chattekst dersom begge var ment.'
+          : '\n\nVIKTIG (siste brukermelding gjelder styrke): Kall create_strength_program — ikke create_running_program, selv om det nevnes løp, konkurranse eller dato. Fyll sessions med kun styrkeøkter. Konkurranse, løp eller dato høyst i fritekstsvaret, ikke som løpeøkter i verktøydata. main_race_date hører til løpeverktøyet; ikke bruk løpeverktøy her.'
+        : '';
+      const ambiguousProgramBlock = programKindAmbiguous
+        ? '\n\nUSIKKER PROGRAMTYPE: Siste melding kan gjelde en plan over tid, men det er **ikke** tydelig om brukeren vil ha løpeprogram (kun løpeøkter) eller styrkeprogram (gym). Ikke kall create_running_program eller create_strength_program i dette svaret. Still **ett** kort, vennlig spørsmål (én til to setninger), f.eks.: «Lager du løpeprogram eller styrkeprogram?» Når brukeren svarer, bruk så det riktige verktøyet.'
+        : '';
+      const coachSystem = `${baseCoachSystem}${buildCompetitionCoachContext(runningPrograms)}${racePriorityBlock}${strengthToolPriorityBlock}${ambiguousProgramBlock}`;
+      const programIntentHint: 'strength' | 'running' | 'unspecified' =
+        userWantsStrength && !userWantsRunning
+          ? 'strength'
+          : userWantsRunning && !userWantsStrength
+            ? 'running'
+            : 'unspecified';
+      const payload: {
+        messages: { role: string; content: string }[];
+        programIntentHint: typeof programIntentHint;
+      } = {
         messages: [
           {
             role: 'system',
@@ -4210,6 +5853,7 @@ const ChatTab = React.forwardRef<
               content: typeof m.text === 'string' ? m.text : String(m.text ?? ''),
             })),
         ],
+        programIntentHint,
       };
 
       const resp = await apiFetch('/chat', {
@@ -4234,13 +5878,41 @@ const ChatTab = React.forwardRef<
       let replyText = (data?.text || '').trim();
       if (!replyText && tr?.kind === 'running_program') {
         replyText =
-          'Her er løpeprogrammet. Trykk «Lagre som løpeprogram» for å bruke det under fanen Løpeprogram.';
+          'Her er løpeprogrammet. Trykk «Lagre som løpeprogram» for å bruke det under Program-fanen (Løpeprogram).';
+      }
+      if (!replyText && tr?.kind === 'strength_program') {
+        replyText =
+          'Her er styrkeprogrammet. Trykk «Lagre som styrkeprogram» for å bruke det under Program-fanen (Styrkeprogram).';
       }
       if (!replyText && tr?.kind === 'tool_card') {
         replyText = 'Her er et kort svar (se boksen under).';
       }
-      if (!replyText && !tr) {
+      if (!replyText && tr == null) {
         throw new Error('Tomt svar fra chat (JSON OK men ingen tekst eller verktøydata).');
+      }
+
+      /** Siste forsvar: eldre backend kan returnere `running_program` selv når appen tydelig mente styrke — ikke vis «Lagre som løpeprogram» / lagre under løp. */
+      let toolResultForMessage: typeof tr = tr;
+      if (tr?.kind === 'running_program' && programIntentHint === 'strength') {
+        toolResultForMessage = {
+          kind: 'tool_card',
+          title: 'Feil programtype (løp i stedet for styrke)',
+          bullets: [
+            'Appen sendte styrke som mål, men fikk løpe-sjekkliste. Oppdater server til siste kode, eller skriv styrkeønsket kort i ny melding (f.eks. «styrkeprogram, 8 uker, 3 styrkeøkter i uken»).',
+          ],
+        };
+        replyText =
+          'Jeg så styrke som målet ditt, men forslaget fulgte løpe-mal. Prøv en kort ny melding, eller sjekk at chat-serveren er oppdatert.';
+      } else if (tr?.kind === 'strength_program' && programIntentHint === 'running') {
+        toolResultForMessage = {
+          kind: 'tool_card',
+          title: 'Feil programtype (styrke i stedet for løp)',
+          bullets: [
+            'Appen sendte løp som mål, men fikk styrke-sjekkliste. Send løpeønsket kort i ny melding, eller oppdater server.',
+          ],
+        };
+        replyText =
+          'Jeg så løp som målet ditt, men forslaget fulgte styrke-mal. Prøv gjerne på nytt, eller sjekk at chat-serveren er oppdatert.';
       }
 
       const assistantMsg: ChatMessage = {
@@ -4248,8 +5920,9 @@ const ChatTab = React.forwardRef<
         role: 'assistant',
         text: replyText,
         createdAt: Date.now(),
-        toolCard: tr?.kind === 'tool_card' ? tr : undefined,
-        runningProgram: tr?.kind === 'running_program' ? tr : undefined,
+        toolCard: toolResultForMessage?.kind === 'tool_card' ? toolResultForMessage : undefined,
+        runningProgram: toolResultForMessage?.kind === 'running_program' ? toolResultForMessage : undefined,
+        strengthProgram: toolResultForMessage?.kind === 'strength_program' ? toolResultForMessage : undefined,
       };
 
       setMessages((prev) => [assistantMsg, ...prev]);
@@ -4282,6 +5955,8 @@ const ChatTab = React.forwardRef<
     const isUser = message.role === 'user';
     const rp = message.runningProgram;
     const rpSaved = message.runningProgramSaved;
+    const sp = message.strengthProgram;
+    const spSaved = message.strengthProgramSaved;
     return (
       <View style={[styles.bubbleRow, isUser ? styles.bubbleRowRight : styles.bubbleRowLeft]}>
         <View style={styles.bubbleColumn}>
@@ -4312,7 +5987,7 @@ const ChatTab = React.forwardRef<
                 </Text>
               ) : null}
               <Text style={styles.runningProgramPreviewMeta}>
-                {rp.weeks} uker · {rp.sessions.length} økter i planen
+                {deriveProgramWeeksFromItems(rp.sessions)} uker · {rp.sessions.length} økter i planen
               </Text>
               {rp.sessions.slice(0, 4).map((s, idx) => (
                 <Text key={idx} style={styles.runningProgramPreviewLine}>
@@ -4330,7 +6005,9 @@ const ChatTab = React.forwardRef<
                   onSaveRunningProgram(rp);
                   setMessages((prev) => {
                     const next = prev.map((m) =>
-                      m.id === message.id ? { ...m, runningProgramSaved: true } : m,
+                      m.id === message.id
+                        ? { ...m, runningProgramSaved: true, strengthProgramSaved: false }
+                        : m,
                     );
                     // Persist synchronously so the flag survives even if the user
                     // switches tab right after (which would unmount ChatTab before
@@ -4340,7 +6017,7 @@ const ChatTab = React.forwardRef<
                     );
                     return next;
                   });
-                  onAfterProgramSaved?.();
+                  onAfterProgramSaved?.('running');
                 }}
                 style={({ pressed }) => [
                   styles.saveProgramButton,
@@ -4356,6 +6033,58 @@ const ChatTab = React.forwardRef<
                   ]}
                 >
                   {rpSaved ? '✓ Løpeprogram lagret' : 'Lagre som løpeprogram'}
+                </Text>
+              </Pressable>
+            </View>
+          ) : null}
+          {sp ? (
+            <View style={styles.runningProgramPreview}>
+              <Text style={styles.runningProgramPreviewTitle}>{sp.title}</Text>
+              <Text style={styles.runningProgramPreviewGoal}>{sp.goalSummary}</Text>
+              <Text style={styles.runningProgramPreviewMeta}>
+                {deriveProgramWeeksFromItems(sp.sessions)} uker · {sp.sessions.length} økter i planen
+              </Text>
+              {sp.sessions.slice(0, 4).map((s, idx) => (
+                <Text key={idx} style={styles.runningProgramPreviewLine}>
+                  • Uke {s.week}
+                  {s.date ? ` · ${formatNorwegianDate(s.date)}` : ''} ({s.dayLabel}): {s.title}
+                </Text>
+              ))}
+              {sp.sessions.length > 4 ? (
+                <Text style={styles.runningProgramPreviewMore}>+ {sp.sessions.length - 4} flere …</Text>
+              ) : null}
+              <Pressable
+                onPress={() => {
+                  if (spSaved) return;
+                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                  onSaveStrengthProgram(sp);
+                  setMessages((prev) => {
+                    const next = prev.map((m) =>
+                      m.id === message.id
+                        ? { ...m, strengthProgramSaved: true, runningProgramSaved: false }
+                        : m,
+                    );
+                    AsyncStorage.setItem(chatStorageKey, JSON.stringify(next)).catch(
+                      () => undefined,
+                    );
+                    return next;
+                  });
+                  onAfterProgramSaved?.('strength');
+                }}
+                style={({ pressed }) => [
+                  styles.saveProgramButton,
+                  spSaved && styles.saveProgramButtonDisabled,
+                  pressed && !spSaved && { opacity: 0.85 },
+                ]}
+                disabled={!!spSaved}
+              >
+                <Text
+                  style={[
+                    styles.saveProgramButtonText,
+                    spSaved && styles.saveProgramButtonTextDisabled,
+                  ]}
+                >
+                  {spSaved ? '✓ Styrkeprogram lagret' : 'Lagre som styrkeprogram'}
                 </Text>
               </Pressable>
             </View>
@@ -4755,6 +6484,78 @@ function extractStatedCompetitionYmdFromText(text: string): { ymd: string; human
   return { ymd: top.ymd, human: top.human };
 }
 
+/**
+ * Siste brukermelding ber uttrykkelig om styrkeprogram / styrkeplan — da skal modellen
+ * kalle create_strength_program, ikke løpeverktøyet (se også prioritering i handleSend).
+ */
+function wantsStrengthProgramIntent(message: string): boolean {
+  const t = message.toLowerCase();
+  if (/\bstyrkeprogram\w*|\bstyrke\s+program\w*|\bstyrkeplan\w*|\bstyrke\s+plan\w*/.test(t)) return true;
+  if (/\b(trener|tren\w*)\b[^.!?\n]{0,100}\b(styrkeprogram|styrke\s*program|sjekkliste\s+for\s+styrke|gym|styrkeøkter)\b/.test(t)) return true;
+  if (
+    /(?:\boppret\w*|\blag\w*|\bbygg\w*|\bbygge\w*|\bgi\w*|\bgi meg\w*|\bta\w*|\bskap\w*|\btreng\w*|\bønsker\w*|\bber om\w*|\bforesp\w*|\bfå\w*|\bkan du\w*|\bville ha\w*)\b[^.!?\n]{0,100}\b(?:et\s+)?styrke(?:\s*program\w*|\s*plan\w*|\b)/.test(
+      t,
+    )
+  )
+    return true;
+  if (
+    /\b(styrketr\w*ning|styrkeøkter|styrkeøkt|gym\w*program|gym\w*plan|vekter?|knebøy|markløft|benkpress|pull[\s-]+up|pullups?|chin[\s-]+up)\b/.test(
+      t,
+    ) &&
+    /program|plan|uker|uke|økter?|sjekkliste|gym|per uke|i uken|flere uker|ukentlig/.test(t)
+  ) {
+    if (/\b(kun|bare|hovedsakelig|først|primært)\b[^.!?\n]{0,30}\bløpe?/.test(t) && !/\bstyrke/.test(t)) return false;
+    if (/\bløpeprogram\w*|\bløpe\s+program/.test(t) && !/\bstyrke/.test(t)) return false;
+    return true;
+  }
+  if (
+    /\b(styrk|gym|vekter?)\b/.test(t) &&
+    /(?:\bmed\b|\bfor\b|\bfokus|til\s+styr|slik at|ønsker|vil ha|mål)\b/.test(t) &&
+    /program|plan|uker|økter?|sjekkliste|økter?\s*per|økter?\s+i/.test(t)
+  ) {
+    if (/(?:\bkun|bare|hovedsakelig)\b[^.!?\n]{0,40}\bløp/i.test(t) && !/\bstyrke/.test(t)) return false;
+    return true;
+  }
+  if (/(?:\bkun|bare|hovedsakelig|primært|fokus|vektpå|vekt\s*på)\b[^.!?\n]{0,50}\bstyrke\b/.test(t) && /program|uker|økt|sjekkliste/.test(t)) return true;
+  if (/(?:\bkun|bare|hovedsakelig)\b[^.!?\n]{0,40}\bstyrke\b/.test(t) && /program|uke|uker|økt|økter|sjekkliste|vekt/.test(t)) return true;
+  if (
+    /(?:\bgym\b|\bvekt\w*|\btyngde\w*|\bknebøy|\bmarkløft)/.test(t) &&
+    /program|ukeplan|uker|økter/.test(t) &&
+    !/\bløpeprogram\w*|\bløpe\s+program/.test(t)
+  )
+    return true;
+  return false;
+}
+
+function wantsRunningProgramIntent(message: string): boolean {
+  const t = message.toLowerCase();
+  if (/\bløpeprogram\w*|\bløpe\s+program\w*|\bløpeplan\w*|\bløpe\s+plan\w*|\bintervallprogram\w*|\bmosjon(?:s)?løp\w*|\b(løp|løping|løpetur\w*)\b[^.!?\n]{0,30}\bprogram\b/.test(t))
+    return true;
+  if (
+    /(?:\boppret\w*|\blag\w*|\bbygg\w*|\bbygge\w*|\bgi\w*|\bgi meg\w*|\bskap\w*|\btreng\w*|\bønsker\w*|\bber om\w*|\bkan du\w*)\b[^.!?\n]{0,100}\b(?:et\s+)?løpe?program\w?/.test(t)
+  )
+    return true;
+  if (/(?:\bintervall|fartlek|terkel|terskel|langtur|mengde|rolig\w* løp|konkurrans\w* løp|10\s*km|5\s*km|maraton|halvmaraton)\b/.test(t) && /\bprogram|ukeplan|flere uker|uker med/.test(t) && !/\bstyrkeprogram|\bstyrke\s+program|\bfokus.*styrke\b/.test(t))
+    return true;
+  return false;
+}
+
+/**
+ * Bruker ber om en plan over tid/økter, men det er uklart om løp eller styrke — be om avklaring i stedet for å gjette.
+ */
+function wantsProgramKindAmbiguous(message: string): boolean {
+  if (wantsStrengthProgramIntent(message) || wantsRunningProgramIntent(message)) return false;
+  const t = message.toLowerCase();
+  if (!t.trim()) return false;
+  const programny = /treningsprogram|sjekkliste|ukeplan|flere\s*uker|\b\d{1,2}\s*uker\b|programmet|treningsplan|per uke|økter?\s*per|økter?\s+i\s*uken|over\s+\d{1,2}\s*uker|plan\s+over|uke\s*for\s*uke|uke-for-uke|lag(?:ge|et)\s+plan|l(?:age|ar)\s+et\s+program|nytt\s+program|et\s+program/.test(
+    t,
+  );
+  if (!programny) return false;
+  if (/\b(styrk|gym|vekter?|knebøy|kne-?bøy|markløft|styrketr)/.test(t)) return false;
+  if (/\b(løpe|løping|løp\s|løptur|intervall|terkel|5\s*km|10\s*km|maraton|halvmaraton|mosjon\w*løp|konkurranse\w*løp|rolig\w*løp)\b/.test(t)) return false;
+  return true;
+}
+
 function buildCompetitionCoachContext(programs: SavedRunningProgram[]): string {
   const lines: string[] = [];
   for (const p of programs) {
@@ -4769,7 +6570,7 @@ function buildCompetitionCoachContext(programs: SavedRunningProgram[]): string {
   }
   if (lines.length === 0) return '';
   return (
-    '\n\nKun som referanse — allerede lagret under fanen Løpeprogram (kan være et annet løp enn det brukeren nettopp skriver om i chat):\n' +
+    '\n\nKun som referanse — allerede lagret under Program → Løpeprogram (kan være et annet løp enn det brukeren nettopp skriver om i chat):\n' +
     lines.join('\n') +
     '\nBruk **ikke** disse datoene i create_running_program når brukeren i samme samtale har sagt en ny konkurranse eller dato — da gjelder det brukeren sier nå. Ta hensyn til dato og navn ved oppfølging. Unngå å gjenta samme oppfølgingsspørsmål samme dag hvis det allerede er sendt en egen melding om konkurransen.'
   );
@@ -4794,7 +6595,15 @@ function formatChatTime(ts: number): string {
 function showRunningProgramHelp() {
   Alert.alert(
     'Løpeprogram og Chat',
-    'Du kan opprette et program her med «Nytt løpeprogram», eller få hjelp i fanen Chat: beskriv målet eller ønsket plan. Når du får et forslag til løpeprogram i chatten, trykk «Lagre som løpeprogram» på svaret – da legges programmet inn her. Under redigering kan du legge inn konkurranse og dato, så treneren i chatten ser det og kan følge opp dagen etter.',
+    'Du kan opprette med «Nytt løpeprogram», eller få hjelp i fanen Chat: beskriv målet eller ønsket plan. Når du får et forslag i chatten, trykk «Lagre som løpeprogram» – da legges programmet inn under Løpeprogram. Under redigering kan du legge inn konkurranse og dato, så treneren i chatten ser det og kan følge opp dagen etter.',
+    [{ text: 'OK' }],
+  );
+}
+
+function showStrengthProgramHelp() {
+  Alert.alert(
+    'Styrkeprogram og Chat',
+    'Du kan opprette med «Nytt styrkeprogram», eller få hjelp i fanen Chat. Når du får et forslag, trykk «Lagre som styrkeprogram» – da legges sjekklisten inn under Styrkeprogram.',
     [{ text: 'OK' }],
   );
 }
@@ -5335,9 +7144,12 @@ function AuthenticatedApp() {
   const chatStorageKey = userKey(CHAT_STORAGE_KEY, userId);
   const sessionsKey = userKey(STORAGE_KEY, userId);
   const runningProgramsKey = userKey(RUNNING_PROGRAMS_KEY, userId);
+  const strengthProgramsKey = userKey(STRENGTH_PROGRAMS_KEY, userId);
   const stravaCacheKeyForUser = userKey(STRAVA_CACHE_KEY, userId);
 
   const [activeTab, setActiveTab] = useState<Tab>('Chat');
+  /** Løpe- vs. styrkeseksjon inne i Program-fanen. */
+  const [programSection, setProgramSection] = useState<ProgramSubTab>('running');
   const [chatSettingsOpen, setChatSettingsOpen] = useState(false);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
   const [hasUnreadChat, setHasUnreadChat] = useState(false);
@@ -5412,6 +7224,8 @@ function AuthenticatedApp() {
   const [hasLoaded, setHasLoaded] = useState(false);
   const [runningPrograms, setRunningPrograms] = useState<SavedRunningProgram[]>([]);
   const [runningProgramsLoaded, setRunningProgramsLoaded] = useState(false);
+  const [strengthPrograms, setStrengthPrograms] = useState<SavedRunningProgram[]>([]);
+  const [strengthProgramsLoaded, setStrengthProgramsLoaded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshSignal, setRefreshSignal] = useState(0);
 
@@ -5419,9 +7233,10 @@ function AuthenticatedApp() {
     setRefreshing(true);
     void Haptics.selectionAsync();
     try {
-      const [rawSessions, rawPrograms] = await Promise.all([
+      const [rawSessions, rawPrograms, rawStrength] = await Promise.all([
         AsyncStorage.getItem(sessionsKey),
         AsyncStorage.getItem(runningProgramsKey),
+        AsyncStorage.getItem(strengthProgramsKey),
       ]);
       if (rawSessions) {
         const parsed = JSON.parse(rawSessions) as unknown;
@@ -5431,6 +7246,10 @@ function AuthenticatedApp() {
         const parsed = JSON.parse(rawPrograms) as unknown;
         if (Array.isArray(parsed)) setRunningPrograms(parsed as SavedRunningProgram[]);
       }
+      if (rawStrength) {
+        const parsed = JSON.parse(rawStrength) as unknown;
+        if (Array.isArray(parsed)) setStrengthPrograms(parsed as SavedRunningProgram[]);
+      }
     } catch {
       // ignore
     }
@@ -5438,7 +7257,7 @@ function AuthenticatedApp() {
     // gi Strava-kortene litt tid til å vise spinner før vi skjuler pull-to-refresh
     await new Promise((resolve) => setTimeout(resolve, 700));
     setRefreshing(false);
-  }, [sessionsKey, runningProgramsKey]);
+  }, [sessionsKey, runningProgramsKey, strengthProgramsKey]);
 
   // Lukk innstillinger når brukeren bytter fane (unngå «hengende» modal).
   useEffect(() => {
@@ -5529,6 +7348,29 @@ function AuthenticatedApp() {
   }, [runningProgramsKey]);
 
   useEffect(() => {
+    setStrengthProgramsLoaded(false);
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(strengthProgramsKey);
+        if (raw) {
+          const parsed = JSON.parse(raw) as unknown;
+          if (Array.isArray(parsed)) {
+            setStrengthPrograms(parsed as SavedRunningProgram[]);
+          } else {
+            setStrengthPrograms([]);
+          }
+        } else {
+          setStrengthPrograms([]);
+        }
+      } catch {
+        // ignore
+      } finally {
+        setStrengthProgramsLoaded(true);
+      }
+    })();
+  }, [strengthProgramsKey]);
+
+  useEffect(() => {
     if (!hasLoaded) return;
     AsyncStorage.setItem(sessionsKey, JSON.stringify(sessions)).catch(() => undefined);
   }, [sessions, hasLoaded, sessionsKey]);
@@ -5537,6 +7379,11 @@ function AuthenticatedApp() {
     if (!runningProgramsLoaded) return;
     AsyncStorage.setItem(runningProgramsKey, JSON.stringify(runningPrograms)).catch(() => undefined);
   }, [runningPrograms, runningProgramsLoaded, runningProgramsKey]);
+
+  useEffect(() => {
+    if (!strengthProgramsLoaded) return;
+    AsyncStorage.setItem(strengthProgramsKey, JSON.stringify(strengthPrograms)).catch(() => undefined);
+  }, [strengthPrograms, strengthProgramsLoaded, strengthProgramsKey]);
 
   useEffect(() => {
     if (!runningProgramsLoaded) return;
@@ -5722,6 +7569,10 @@ function AuthenticatedApp() {
   );
 
   function saveRunningProgramFromChat(payload: RunningProgramPayload) {
+    if (payload.kind !== 'running_program') {
+      showToast('Kunne ikke lagre: forventet løpeprogram (feil svarformat).');
+      return;
+    }
     const id = `rp-${Date.now()}`;
     const items: SavedProgramItem[] = payload.sessions.map((s, i) => {
       const wt =
@@ -5747,7 +7598,7 @@ function AuthenticatedApp() {
         id,
         title: payload.title,
         goalSummary: payload.goalSummary,
-        weeks: payload.weeks,
+        weeks: deriveProgramWeeksFromItems(items),
         competitionName: cn || undefined,
         competitionDate:
           cd && /^\d{4}-\d{2}-\d{2}$/.test(cd) ? cd : undefined,
@@ -5757,6 +7608,7 @@ function AuthenticatedApp() {
       },
       ...prev,
     ]);
+    showToast('Løpeprogram lagret');
   }
 
   function toggleRunningProgramItem(programId: string, itemId: string) {
@@ -5774,6 +7626,22 @@ function AuthenticatedApp() {
 
   function deleteRunningProgram(programId: string) {
     setRunningPrograms((prev) => prev.filter((p) => p.id !== programId));
+  }
+
+  function copyRunningProgram(programId: string) {
+    setRunningPrograms((prev) => {
+      const p = prev.find((x) => x.id === programId);
+      if (!p) return prev;
+      return [cloneSavedProgram(p, 'rp'), ...prev];
+    });
+  }
+
+  function copyStrengthProgram(programId: string) {
+    setStrengthPrograms((prev) => {
+      const p = prev.find((x) => x.id === programId);
+      if (!p) return prev;
+      return [cloneSavedProgram(p, 'sp'), ...prev];
+    });
   }
 
   function moveRunningProgramInTab(
@@ -5847,7 +7715,7 @@ function AuthenticatedApp() {
           id,
           title: payload.title,
           goalSummary: payload.goalSummary || 'Eget program',
-          weeks: payload.weeks,
+          weeks: deriveProgramWeeksFromItems(items),
           competitionName,
           competitionDate,
           createdAt: now,
@@ -5877,9 +7745,213 @@ function AuthenticatedApp() {
           ...p,
           title: payload.title,
           goalSummary: payload.goalSummary,
-          weeks: payload.weeks,
+          weeks: deriveProgramWeeksFromItems(items),
           competitionName,
           competitionDate,
+          updatedAt: Date.now(),
+          items,
+        };
+      }),
+    );
+  }
+
+  function saveStrengthProgramFromChat(payload: StrengthProgramPayload) {
+    if (payload.kind !== 'strength_program') {
+      showToast('Kunne ikke lagre: forventet styrkeprogram (feil svarformat).');
+      return;
+    }
+    const id = `sp-${Date.now()}`;
+    const items: SavedProgramItem[] = payload.sessions.map((s, i) => {
+      const wt =
+        s.workoutType ??
+        (strengthWorkoutTypeValues.includes(s.title) ? s.title : undefined);
+      const d = s.date?.trim();
+      return {
+        id: `${id}-item-${i}`,
+        week: s.week,
+        dayLabel: s.dayLabel,
+        title: s.title,
+        description: s.description,
+        done: false,
+        date: d && /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : undefined,
+        workoutType: wt,
+      };
+    });
+    const now = Date.now();
+    setStrengthPrograms((prev) => [
+      {
+        id,
+        title: payload.title,
+        goalSummary: payload.goalSummary,
+        weeks: deriveProgramWeeksFromItems(items),
+        createdAt: now,
+        updatedAt: now,
+        items,
+      },
+      ...prev,
+    ]);
+    showToast('Styrkeprogram lagret');
+  }
+
+  function toggleStrengthProgramItem(programId: string, itemId: string) {
+    setStrengthPrograms((prev) =>
+      prev.map((p) => {
+        if (p.id !== programId) return p;
+        return {
+          ...p,
+          updatedAt: Date.now(),
+          items: p.items.map((it) => (it.id === itemId ? { ...it, done: !it.done } : it)),
+        };
+      }),
+    );
+  }
+
+  function patchStrengthProgramSet(
+    programId: string,
+    itemId: string,
+    exIdx: number,
+    setIdx: number,
+    patch: Partial<Pick<StrengthExerciseSetSaved, 'setDone' | 'actualReps' | 'actualWeightKg' | 'actualTimeMinutes'>>,
+  ) {
+    setStrengthPrograms((prev) =>
+      prev.map((p) => {
+        if (p.id !== programId) return p;
+        return {
+          ...p,
+          updatedAt: Date.now(),
+          items: p.items.map((it) => {
+            if (it.id !== itemId) return it;
+            const exList = it.strengthExercises ? [...it.strengthExercises] : [];
+            const pEx = exList[exIdx];
+            if (!pEx) return it;
+            const ex: StrengthExerciseSaved = { ...pEx, sets: [...(pEx.sets || [])] };
+            if (!ex.sets[setIdx]) return it;
+            ex.sets[setIdx] = applyStrengthSetLogPatch(ex.sets[setIdx], patch);
+            exList[exIdx] = ex;
+            const nextIt: SavedProgramItem = { ...it, strengthExercises: exList };
+            return { ...nextIt, done: strengthChecklistItemDone(nextIt) };
+          }),
+        };
+      }),
+    );
+  }
+
+  function deleteStrengthProgram(programId: string) {
+    setStrengthPrograms((prev) => prev.filter((p) => p.id !== programId));
+  }
+
+  function moveStrengthProgramInTab(
+    tab: 'active' | 'completed',
+    programId: string,
+    direction: 'up' | 'down',
+  ) {
+    setStrengthPrograms((prev) => {
+      const now = Date.now();
+      const isCompleted = (p: SavedRunningProgram) =>
+        p.items.length > 0 && p.items.every((it) => strengthChecklistItemDone(it));
+      const isVisibleForTab = (p: SavedRunningProgram) =>
+        tab === 'completed' ? isCompleted(p) : !isCompleted(p);
+      const visible = prev.filter(isVisibleForTab);
+      const idx = visible.findIndex((p) => p.id === programId);
+      if (idx < 0) return prev;
+      const j = direction === 'up' ? idx - 1 : idx + 1;
+      if (j < 0 || j >= visible.length) return prev;
+      const swapped = [...visible];
+      const tmp = swapped[idx];
+      swapped[idx] = swapped[j];
+      swapped[j] = tmp;
+      let i = 0;
+      return prev.map((p) => {
+        if (!isVisibleForTab(p)) return p;
+        return { ...swapped[i++], updatedAt: now };
+      });
+    });
+  }
+
+  function saveStrengthProgramFromForm(payload: {
+    mode: 'create' | 'edit';
+    programId?: string;
+    title: string;
+    goalSummary: string;
+    competitionName?: string;
+    competitionDate?: string;
+    weeks: number;
+    items: Array<{
+      id?: string;
+      week: number;
+      dayLabel: string;
+      title: string;
+      description: string;
+      date?: string;
+      done: boolean;
+      workoutType?: string;
+      strengthExercises?: StrengthExerciseSaved[];
+    }>;
+  }) {
+    if (payload.mode === 'create') {
+      const id = `sp-${Date.now()}`;
+      const items: SavedProgramItem[] = payload.items.map((it, i) => ({
+        id: `${id}-item-${i}`,
+        week: it.week,
+        dayLabel: it.dayLabel,
+        title: it.title,
+        description: it.description,
+        date: it.date,
+        done: it.done,
+        workoutType: it.workoutType,
+        ...(it.strengthExercises && it.strengthExercises.length > 0
+          ? { strengthExercises: it.strengthExercises }
+          : {}),
+      }));
+      const now = Date.now();
+      setStrengthPrograms((prev) => [
+        {
+          id,
+          title: payload.title,
+          goalSummary: payload.goalSummary || 'Eget program',
+          weeks: deriveProgramWeeksFromItems(items),
+          createdAt: now,
+          updatedAt: now,
+          items,
+        },
+        ...prev,
+      ]);
+      return;
+    }
+    const pid = payload.programId;
+    if (!pid) return;
+    setStrengthPrograms((prev) =>
+      prev.map((p) => {
+        if (p.id !== pid) return p;
+        const prevById = new Map(p.items.map((x) => [x.id, x]));
+        const items: SavedProgramItem[] = payload.items.map((it, i) => {
+          const id = it.id ?? `${pid}-n-${Date.now()}-${i}`;
+          const prevIt = it.id != null ? prevById.get(it.id) : undefined;
+          const mergedEx =
+            it.strengthExercises && it.strengthExercises.length > 0 && prevIt?.strengthExercises
+              ? mergeStrengthExercisesWithProgress(prevIt.strengthExercises, it.strengthExercises)
+              : it.strengthExercises;
+          const base: SavedProgramItem = {
+            id,
+            week: it.week,
+            dayLabel: it.dayLabel,
+            title: it.title,
+            description: it.description,
+            date: it.date,
+            done: it.done,
+            workoutType: it.workoutType,
+            ...(mergedEx && mergedEx.length > 0 ? { strengthExercises: mergedEx } : {}),
+          };
+          if (base.strengthExercises?.length) {
+            return { ...base, done: strengthChecklistItemDone(base) };
+          }
+          return base;
+        });
+        return {
+          ...p,
+          title: payload.title,
+          goalSummary: payload.goalSummary,
+          weeks: deriveProgramWeeksFromItems(items),
           updatedAt: Date.now(),
           items,
         };
@@ -5891,34 +7963,6 @@ function AuthenticatedApp() {
     <View style={{ gap: 10 }}>
       <Text style={styles.h1}>Hei Helene 🏃🏼‍♀️</Text>
       <Text style={styles.quoteText}>"{dailyQuote}"</Text>
-    </View>
-  );
-
-  const programHeader = (
-    <View style={styles.programHeaderRow}>
-      <Text style={[styles.h1, { flex: 1, minWidth: 0 }]} numberOfLines={2}>
-        Løpeprogram 🗓️
-      </Text>
-      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-        <Pressable
-          onPress={showRunningProgramHelp}
-          style={styles.programHelpIcon}
-          accessibilityRole="button"
-          accessibilityLabel="Hjelp: løpeprogram og Chat"
-          accessibilityHint="Forklarer hvordan du kan lage løpeprogram via Chat"
-          hitSlop={8}
-        >
-          <Text style={styles.programHelpIconText}>?</Text>
-        </Pressable>
-        <Pressable
-          onPress={openAppSettings}
-          accessibilityRole="button"
-          accessibilityLabel="Innstillinger"
-          style={({ pressed }) => [styles.chatGearButton, pressed && { opacity: 0.6, transform: [{ scale: 0.94 }] }]}
-        >
-          <Text style={styles.chatGearIcon}>⚙️</Text>
-        </Pressable>
-      </View>
     </View>
   );
 
@@ -5963,6 +8007,16 @@ function AuthenticatedApp() {
     if (tab === 'Chat') setHasUnreadChat(false);
     pagerRef.current?.setPage(idx);
   }, []);
+
+  const handleAfterProgramSavedFromChat = useCallback(
+    (kind: ProgramSubTab) => {
+      setProgramSection(kind);
+      requestAnimationFrame(() => {
+        handleTabPress('Program');
+      });
+    },
+    [handleTabPress],
+  );
 
   const handlePageSelected = useCallback(
     (e: { nativeEvent: { position: number } }) => {
@@ -6013,7 +8067,8 @@ function AuthenticatedApp() {
                   ref={chatRef}
                   runningPrograms={runningPrograms}
                   onSaveRunningProgram={saveRunningProgramFromChat}
-                  onAfterProgramSaved={() => handleTabPress('Løpeprogram')}
+                  onSaveStrengthProgram={saveStrengthProgramFromChat}
+                  onAfterProgramSaved={handleAfterProgramSavedFromChat}
                   onCompetitionFollowupPosted={() => {
                     if (activeTabRef.current !== 'Chat') setHasUnreadChat(true);
                   }}
@@ -6022,11 +8077,12 @@ function AuthenticatedApp() {
             </View>
           </View>
 
-          <View key="Løpeprogram" style={styles.contentArea} collapsable={false}>
+          <View key="Program" style={styles.contentArea} collapsable={false}>
             <ScrollView
               contentContainerStyle={styles.container}
               contentInsetAdjustmentBehavior="never"
               automaticallyAdjustContentInsets={false}
+              keyboardShouldPersistTaps="handled"
               refreshControl={
                 <RefreshControl
                   refreshing={refreshing}
@@ -6036,14 +8092,92 @@ function AuthenticatedApp() {
                 />
               }
             >
-              {programHeader}
-              <RunningProgramTab
-                programs={runningPrograms}
-                onToggleItem={toggleRunningProgramItem}
-                onDeleteProgram={deleteRunningProgram}
-                onSaveProgram={saveProgramFromForm}
-                onMoveRunningProgramInTab={moveRunningProgramInTab}
-              />
+              <View style={styles.programHeaderRow}>
+                <Text style={[styles.h1, { flex: 1, minWidth: 0 }]} numberOfLines={2}>
+                  Program
+                </Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                  <Pressable
+                    onPress={() => {
+                      void Haptics.selectionAsync();
+                      if (programSection === 'running') showRunningProgramHelp();
+                      else showStrengthProgramHelp();
+                    }}
+                    style={styles.programHelpIcon}
+                    accessibilityRole="button"
+                    accessibilityLabel={
+                      programSection === 'running' ? 'Hjelp: løpeprogram og Chat' : 'Hjelp: styrkeprogram og Chat'
+                    }
+                    accessibilityHint={
+                      programSection === 'running'
+                        ? 'Forklarer hvordan du kan lage løpeprogram via Chat'
+                        : 'Forklarer hvordan du kan lage styrkeprogram via Chat'
+                    }
+                    hitSlop={8}
+                  >
+                    <Text style={styles.programHelpIconText}>?</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={openAppSettings}
+                    accessibilityRole="button"
+                    accessibilityLabel="Innstillinger"
+                    style={({ pressed }) => [styles.chatGearButton, pressed && { opacity: 0.6, transform: [{ scale: 0.94 }] }]}
+                  >
+                    <Text style={styles.chatGearIcon}>⚙️</Text>
+                  </Pressable>
+                </View>
+              </View>
+              <View style={styles.programSubTabBar}>
+                {(
+                  [
+                    { id: 'running' as const, label: 'Løpeprogram' },
+                    { id: 'strength' as const, label: 'Styrkeprogram' },
+                  ] as const
+                ).map((t) => {
+                  const subActive = programSection === t.id;
+                  return (
+                    <Pressable
+                      key={t.id}
+                      onPress={() => {
+                        void Haptics.selectionAsync();
+                        setProgramSection(t.id);
+                      }}
+                      style={[styles.programSubTab, subActive && styles.programSubTabActive]}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: subActive }}
+                      accessibilityLabel={t.label}
+                    >
+                      <Text
+                        style={[styles.programSubTabText, subActive && styles.programSubTabTextActive]}
+                      >
+                        {t.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              {programSection === 'running' ? (
+                <ChecklistProgramTab
+                  variant="running"
+                  programs={runningPrograms}
+                  onToggleItem={toggleRunningProgramItem}
+                  onDeleteProgram={deleteRunningProgram}
+                  onSaveProgram={saveProgramFromForm}
+                  onMoveProgramInTab={moveRunningProgramInTab}
+                  onCopyProgram={copyRunningProgram}
+                />
+              ) : (
+                <ChecklistProgramTab
+                  variant="strength"
+                  programs={strengthPrograms}
+                  onToggleItem={toggleStrengthProgramItem}
+                  onDeleteProgram={deleteStrengthProgram}
+                  onSaveProgram={saveStrengthProgramFromForm}
+                  onMoveProgramInTab={moveStrengthProgramInTab}
+                  onCopyProgram={copyStrengthProgram}
+                  onPatchStrengthSet={patchStrengthProgramSet}
+                />
+              )}
             </ScrollView>
           </View>
 
@@ -6241,7 +8375,7 @@ function AuthenticatedApp() {
                 void Haptics.selectionAsync();
                 Alert.alert(
                   'Tøm chat-historikk?',
-                  'Alle meldinger i chatten slettes. Lagrede løpeprogrammer under fanen Løpeprogram beholdes.',
+                  'Alle meldinger i chatten slettes. Lagrede løpe- og styrkeprogrammer (Program-fanen) beholdes.',
                   [
                     { text: 'Avbryt', style: 'cancel' },
                     {
@@ -6252,7 +8386,7 @@ function AuthenticatedApp() {
                           id: `${Date.now()}-welcome`,
                           role: 'assistant',
                           text:
-                            'Hei! Jeg er din personlige trener. Jeg kan svare på spørsmål om løping og trening, lage løpeprogrammer du kan lagre som sjekkliste under fanen Løpeprogram, og hente oversikt fra Strava når det er koblet til. Hva lurer du på i dag?',
+                            'Hei! Jeg er din personlige trener. Jeg kan svare på spørsmål om løping og styrke, lage løpe- og styrkeprogrammer du kan lagre som sjekkliste (Program-fanen), og hente oversikt fra Strava når det er koblet til. Hva lurer du på i dag?',
                           createdAt: Date.now(),
                         };
                         try {
@@ -7047,6 +9181,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   programCheckRow: {
+    position: 'relative',
     flexDirection: 'row',
     alignItems: 'flex-start',
     gap: 10,
@@ -7060,6 +9195,17 @@ const styles = StyleSheet.create({
   programCheckRowDone: {
     backgroundColor: '#DCFCE7',
     borderColor: '#86EFAC',
+  },
+  /** Høyre spalte (dato, øvelser) — minWidth:0 så flex-barn får fylle bredden. */
+  programCheckItemBody: {
+    flex: 1,
+    minWidth: 0,
+    alignSelf: 'stretch',
+    gap: 2,
+  },
+  /** Luft mot absolutt chevron, kun første topp (dato/tittel). */
+  programCheckItemTopPadForChevron: {
+    paddingRight: 34,
   },
   programCheckMark: {
     fontSize: 26,
@@ -7079,6 +9225,17 @@ const styles = StyleSheet.create({
     height: 36,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  /** Chevron ligger i flex-udelt spalte (lik horisontal margin til felter under). */
+  programItemChevronBtnAbsolute: {
+    position: 'absolute',
+    right: 2,
+    top: 5,
+    width: 32,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 2,
   },
   programItemChevron: {
     fontSize: 14,
@@ -7103,6 +9260,66 @@ const styles = StyleSheet.create({
   programCheckDescDone: {
     color: '#94a3b8',
     textDecorationLine: 'line-through',
+  },
+  strengthSetLogRow: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'nowrap',
+    gap: 5,
+    marginTop: 4,
+    paddingVertical: 2,
+    alignSelf: 'stretch',
+  },
+  strengthSetCheckBoxBtn: {
+    width: 28,
+    height: 30,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  strengthSetCheckMark: {
+    fontSize: 22,
+    lineHeight: 26,
+    color: '#0f172a',
+  },
+  strengthSetLogHint: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#64748b',
+    flexShrink: 0,
+  },
+  /** Kompakt variant av dropdown (program-skjema bruker høyere padding). */
+  strengthSetLogDropdownCompact: {
+    paddingVertical: 7,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+  },
+  strengthSetLogDropdownValueText: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  strengthSetLogInput: {
+    minWidth: 40,
+    maxWidth: 80,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 8,
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#0f172a',
+    backgroundColor: '#ffffff',
+  },
+  /** Reps- og belastning deler resten av linja likt. */
+  strengthSetLogDropdown: {
+    flex: 1,
+    minWidth: 0,
+  },
+  strengthSetLogDropdownLoad: {
+    flex: 1,
+    minWidth: 0,
   },
   programTabTopRow: {
     flexDirection: 'row',
@@ -7707,6 +9924,165 @@ const styles = StyleSheet.create({
   },
   chipTextInactive: {
     color: '#0f172a',
+  },
+  strengthLoadKindChip: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    borderWidth: 1,
+    minWidth: 56,
+    alignItems: 'center',
+  },
+  strengthLoadKindChipText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  strengthSetTable: {
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    borderRadius: 10,
+    /** Må være synlig; ellers klippes Slett-handling ved sveip. */
+    overflow: 'visible',
+  },
+  strengthSetTableHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+    backgroundColor: '#f8fafc',
+    borderBottomWidth: 1,
+    borderBottomColor: '#e2e8f0',
+  },
+  strengthSetTableTh: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#64748b',
+    textTransform: 'uppercase',
+    letterSpacing: 0.3,
+  },
+  strengthSetTableThN: {
+    width: 32,
+  },
+  /** Smal, fast kolonne: bare tall + chevron for hjul. */
+  strengthSetTableThReps: {
+    width: 76,
+  },
+  strengthSetTableThLoad: {
+    flex: 1,
+    minWidth: 0,
+  },
+  strengthSetTableThKindSlot: {
+    width: 64,
+  },
+  strengthSetTableRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+  },
+  strengthSetTableCellN: {
+    width: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  strengthSetTableRepsCol: {
+    width: 76,
+    flexShrink: 0,
+    justifyContent: 'center',
+  },
+  strengthSetRepsNarrow: {
+    paddingHorizontal: 8,
+  },
+  /** Tid/kg-felt: fyller resten av belastning-kolonnen. */
+  strengthSetTidValueBtn: {
+    flex: 1,
+    minWidth: 0,
+  },
+  strengthSetTableLoadValueRow: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  strengthSetTableLoadValueWrap: {
+    flex: 1,
+    minWidth: 96,
+    justifyContent: 'center',
+    alignSelf: 'stretch',
+  },
+  strengthSetTableValueFieldInner: {
+    minHeight: 44,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    alignSelf: 'stretch',
+  },
+  strengthSetTableValueFieldInput: {
+    minHeight: 44,
+    paddingVertical: 10,
+    marginBottom: 0,
+    minWidth: 0,
+    flex: 1,
+    alignSelf: 'stretch',
+  },
+  strengthSetTablePlaceholderCell: {
+    minHeight: 44,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    borderRadius: 14,
+    backgroundColor: '#f8fafc',
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'stretch',
+  },
+  strengthSetTableDashCell: {
+    fontSize: 15,
+    color: '#94a3b8',
+    textAlign: 'center',
+  },
+  strengthSetKindIconRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 4,
+    width: 64,
+    flexShrink: 0,
+  },
+  strengthSetKindIcon: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  strengthSetKindIconOn: {
+    backgroundColor: '#FFDCDC',
+    borderWidth: 1,
+    borderColor: '#FFD6BA',
+  },
+  strengthSetKindIconOff: {
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  strengthSetTableRowSep: {
+    borderTopWidth: 1,
+    borderTopColor: '#f1f5f9',
+  },
+  strengthSetNumCircle: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#e2e8f0',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  strengthSetNumCircleText: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#475569',
   },
   chipGrid: {
     flexDirection: 'row',

@@ -536,7 +536,7 @@ function getTools() {
       function: {
         name: 'create_running_program',
         description:
-          'Lag et strukturert løpeprogram med én rad per planlagt økt. Kun løpeøkter i sessions — hver rad er én løpeøkt med workout_type som tittel. Ikke legg styrke, core, gym eller «etter løpetur: styrke» inn i noen økts description; det tilhører ikke løpesjekklisten. Eventuell styrkeanbefaling kan du skrive i det vanlige chat-svaret, ikke i verktøydata. Fyll sessions sortert etter uke (uke 1 først). Detaljer (varighet, distanse, intensitet, puls, struktur) kun i description. Antall økter per uke (f.eks. «4 økter») er aldri feltet weeks — weeks er kun antall uker i programmet. Når brukeren nettopp har oppgitt konkurranse/dato i chat, skal main_race_date følge det — ikke en eldre dato fra lagrede programmer i systemkontekst. Viktig: når main_race_date er satt, skal weeks aldri være større enn antall uker fra i dag til konkurransen (ca. ceil(dager/7) fra nåværende dato i Norge); programmet skal ikke fortsette etter konkurranseuken. Når brukeren ber om program frem til den datoen (ikke uttrykkelig bare «siste N uker før»), skal weeks normalt være nøyaktig dette antallet uker, ikke et mindre tall som feiltolkning av økter/uke.',
+          'Kun når brukeren hovedsakelig ber om løpeprogram, løpeuke eller treningsplan for løping. Ikke kall for et rent styrke- eller styrkeprogram-ønske — da bruk create_strength_program. Lag et strukturert løpeprogram med én rad per planlagt økt. Kun løpeøkter i sessions — hver rad er én løpeøkt med workout_type som tittel. Ikke legg styrke, core, gym eller «etter løpetur: styrke» inn i noen økts description; det tilhører ikke løpesjekklisten. Eventuell styrkeanbefaling kan du skrive i det vanlige chat-svaret, ikke i verktøydata. Fyll sessions sortert etter uke (uke 1 først). Detaljer (varighet, distanse, intensitet, puls, struktur) kun i description. Antall økter per uke (f.eks. «4 økter») er aldri feltet weeks — weeks er kun antall uker i programmet. Når brukeren nettopp har oppgitt konkurranse/dato i chat, skal main_race_date følge det — ikke en eldre dato fra lagrede programmer i systemkontekst. Viktig: når main_race_date er satt, skal weeks aldri være større enn antall uker fra i dag til konkurransen (ca. ceil(dager/7) fra nåværende dato i Norge); programmet skal ikke fortsette etter konkurranseuken. Når brukeren ber om program frem til den datoen (ikke uttrykkelig bare «siste N uker før»), skal weeks normalt være nøyaktig dette antallet uker, ikke et mindre tall som feiltolkning av økter/uke.',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -596,11 +596,66 @@ function getTools() {
         },
       },
     },
+    {
+      type: 'function',
+      function: {
+        name: 'create_strength_program',
+        description:
+          'Bruk når brukeren uttrykkelig ber om styrkeprogram, styrkeuke, gymprogram eller fylling med styrkeøkter (appens sjekkliste for Styrkeprogram). Hvis fokus er løpeprogram, bruk create_running_program i stedet. Lag et strukturert styrkeprogram med én rad per planlagt styrkeøkt. Kun styrkeøkter i sessions — hver rad er én økt med session_type som tittel/klassifisering. Fyll sessions sortert etter uke (uke 1 først). Detaljer (øvelser, sett/rep, progresjon, ro, intensitet) kun i description. Antall økter per uke (f.eks. «3 økter») er aldri feltet weeks — weeks er kun antall uker i programmet. sessions må inneholde hele perioden: minst én økt for hver uke fra 1 til weeks, vanligvis 2–4 styrkeøkter per uke. Ikke legg løpeøkter, intervaller eller konkurranse-løp inn i styrkeprogrammet; bruk create_running_program for ren løping.',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            title: { type: 'string', description: 'Kort navn, f.eks. "8 uker styrke grunnlag".' },
+            goal_summary: { type: 'string', description: 'Brukerens mål i én–to setninger.' },
+            weeks: {
+              type: 'number',
+              description: 'Antall uker programmet varer (1–52) — ikke antall økter per uke.',
+            },
+            sessions: {
+              type: 'array',
+              description:
+                'Kun styrkeøkter. Du MÅ fylle inn alle uker 1..weeks: minst én økt per uke (hele blokken, ikke bare første par uker). Hver økt har session_type som tittel; skriv treningsinnholdet i description.',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  week: { type: 'number', description: 'Ukenummer fra 1 til weeks.' },
+                  day_label: {
+                    type: 'string',
+                    description: 'Ukedag eller merking, f.eks. "Mandag" eller "Uke 2 · torsdag".',
+                  },
+                  session_date: {
+                    type: 'string',
+                    description: 'Valgfritt: planlagt dato YYYY-MM-DD for denne økta.',
+                  },
+                  session_type: {
+                    type: 'string',
+                    enum: STRENGTH_SESSION_TYPES,
+                    description:
+                      'Type styrkeøkt — nøyaktig én av enum-verdiene (samme som manuell styrkelogging i appen).',
+                  },
+                  description: {
+                    type: 'string',
+                    description: 'Kun styrke: øvelser, volum, progresjon, pauser, utstyr, skadetiltak — ikke rene løpeøkter.',
+                  },
+                },
+                required: ['week', 'day_label', 'session_type', 'description'],
+              },
+            },
+          },
+          required: ['title', 'goal_summary', 'weeks', 'sessions'],
+        },
+      },
+    },
   ];
 }
 
 /** Må være identisk med enum i OpenAI-tool og App.tsx (unngå valideringsfeil når modellen varierer litt). */
 const RUN_WORKOUT_TYPES = ['Rolig løpetur', 'Terkeløkt', 'Intervaller', 'Konkurranse'];
+
+/** Styrkeøkt-typer — samme som `strengthWorkoutTypeOptions` i App.tsx. */
+const STRENGTH_SESSION_TYPES = ['Fullkropp', 'Bein', 'Overkropp', 'HIIT', 'Skadeforebyggende'];
 
 function normalizeRunWorkoutTypeString(raw) {
   if (raw == null) return '';
@@ -629,6 +684,34 @@ function coerceRunWorkoutType(raw) {
   if (/konkurranse|ritt\b|testøkt|^race$/i.test(lower)) return 'Konkurranse';
   if (/rolig|lett\s*løp|easy|langtur|nedjogg|recovery|hvile.*løp|jogg/i.test(lower)) return 'Rolig løpetur';
   return null;
+}
+
+function normalizeStrengthSessionTypeString(raw) {
+  if (raw == null) return '';
+  const first = Array.isArray(raw) ? raw[0] : raw;
+  let s = String(first);
+  s = s.replace(/[\u200B-\u200D\uFEFF]/g, '');
+  s = s.replace(/\u00a0/g, ' ');
+  s = s.trim().replace(/\s+/g, ' ');
+  return s;
+}
+
+/**
+ * Mapper nesten-riktige strenger fra LLM til eksakt styrke-enum.
+ */
+function coerceStrengthSessionType(raw) {
+  const s = normalizeStrengthSessionTypeString(raw);
+  if (!s) return null;
+  const lower = s.toLowerCase();
+  for (const canon of STRENGTH_SESSION_TYPES) {
+    if (canon.toLowerCase() === lower) return canon;
+  }
+  if (/overkropp|upper|push|pull|bryst|rygg|arm/i.test(s)) return 'Overkropp';
+  if (/bein|leg|knebøy|kne|lower|lår|quad|hamstring|leg day/i.test(s)) return 'Bein';
+  if (/hiit|kondis|intervall.*styrke|circuit/i.test(s)) return 'HIIT';
+  if (/skade|rehab|forebygg|prehab|stabil|core.*skade|magediagonal/i.test(s)) return 'Skadeforebyggende';
+  if (/full|hele kroppen|total body|whole body|fullbody/i.test(s)) return 'Fullkropp';
+  return 'Fullkropp';
 }
 
 function normalizeCreateRunningProgramArgs(args) {
@@ -908,6 +991,95 @@ async function runToolCall(name, args, ctx) {
     };
   }
 
+  if (name === 'create_strength_program') {
+    const strengthTypeEnum = z.enum(STRENGTH_SESSION_TYPES);
+    const schema = z.object({
+      title: z.string().min(2).max(120),
+      goal_summary: z.string().min(2).max(500),
+      weeks: z.number().int().min(1).max(52),
+      sessions: z
+        .array(
+          z.object({
+            week: z.number().int().min(1).max(52),
+            day_label: z.string().min(1).max(80),
+            session_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+            session_type: strengthTypeEnum,
+            description: z.string().min(1).max(800),
+          }),
+        )
+        .min(1)
+        .max(250),
+    });
+    const raw = args && typeof args === 'object' ? { ...args } : {};
+    if (Array.isArray(raw.sessions)) {
+      raw.sessions = raw.sessions.map((sess) => {
+        if (!sess || typeof sess !== 'object') return sess;
+        const st = coerceStrengthSessionType(sess.session_type) || 'Fullkropp';
+        const next = { ...sess, session_type: st };
+        if (next.session_date != null && String(next.session_date).trim() === '') delete next.session_date;
+        return next;
+      });
+    }
+    const parsed = schema.parse(raw);
+
+    const programWeeks = parsed.weeks;
+    const programSessions = parsed.sessions;
+
+    if (programSessions.length === 0) {
+      return {
+        kind: 'tool_card',
+        title: 'Kunne ikke lage styrkeprogram',
+        bullets: ['Ingen økter i programmet.'],
+      };
+    }
+
+    for (const s of programSessions) {
+      if (s.week > programWeeks) {
+        return {
+          kind: 'tool_card',
+          title: 'Kunne ikke lage styrkeprogram',
+          bullets: [`Ukenummer ${s.week} er høyere enn antall uker (${programWeeks}).`],
+        };
+      }
+    }
+
+    const missingWeeks = findMissingProgramWeeks(programWeeks, programSessions);
+    if (missingWeeks.length > 0) {
+      const preview =
+        missingWeeks.length <= 12
+          ? missingWeeks.join(', ')
+          : `${missingWeeks.slice(0, 12).join(', ')} … (+${missingWeeks.length - 12} til)`;
+      return {
+        kind: 'tool_card',
+        title: 'Ufullstendig styrkeprogram',
+        bullets: [
+          `Du satte weeks til ${programWeeks}, men det mangler planlagte økter for hele perioden.`,
+          `Mangler minst én økt i uke: ${preview}.`,
+          'Kall create_strength_program på nytt med komplett sessions: for hver uke fra 1 til weeks (typisk 2–4 styrkeøkter per uke).',
+        ],
+      };
+    }
+
+    return {
+      kind: 'strength_program',
+      title: parsed.title,
+      goalSummary: parsed.goal_summary,
+      weeks: programWeeks,
+      sessions: programSessions.map((s) => {
+        const st = s.session_type;
+        const row = {
+          week: s.week,
+          dayLabel: s.day_label,
+          title: st,
+          description: s.description,
+          workoutType: st,
+        };
+        if (s.session_date) row.date = s.session_date;
+        return row;
+      }),
+    };
+  }
+
   return { kind: 'tool_card', title: `Ukjent tool: ${name}`, bullets: ['Denne toolen finnes ikke på serveren.'] };
 }
 
@@ -926,6 +1098,177 @@ async function safeRunToolCall(name, args, ctx) {
   }
 }
 
+const PROGRAM_KIND_CLARIFY_REPLY =
+  'Jeg lager gjerne en sjekkliste du kan lagre under Program — jeg trenger bare å vite: vil du ha **løpeprogram** (løpeøkter) eller **styrkeprogram** (gym/styrke)? Svar kort, så bruker jeg riktig mal.';
+
+const PROGRAM_KIND_RETRY_FAIL_REPLY =
+  'Jeg var usikker: vil du ha **løpeprogram** eller **styrkeprogram**? Svar med «løping» eller «styrke» (gjerne med antall uker), så lager jeg sjekklisten.';
+
+function getLastUserTextFromChatMessages(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i] && messages[i].role === 'user' && messages[i].content != null) {
+      return String(messages[i].content);
+    }
+  }
+  return '';
+}
+
+/**
+ * Må matche fornuftig med wantsStrengthProgramIntent / wantsProgramKindAmbiguous i App.tsx
+ * (heuristikk, ikke sikkerhet).
+ */
+function chatUserWantsStrengthProgram(m) {
+  const t = String(m).toLowerCase();
+  if (/\bstyrkeprogram\w*|\bstyrke\s+program\w*|\bstyrkeplan\w*|\bstyrke\s+plan\w*/.test(t)) return true;
+  if (/\b(trener|tren\w*)\b[^.!?\n]{0,100}\b(styrkeprogram|styrke\s*program|sjekkliste\s+for\s+styrke|gym|styrkeøkter)\b/.test(t)) return true;
+  if (
+    /(?:\boppret\w*|\blag\w*|\bbygg\w*|\bbygge\w*|\bgi\w*|\bgi meg\w*|\bta\w*|\bskap\w*|\btreng\w*|\bønsker\w*|\bber om\w*|\bforesp\w*|\bfå\w*|\bkan du\w*|\bville ha\w*)\b[^.!?\n]{0,100}\b(?:et\s+)?styrke(?:\s*program\w*|\s*plan\w*|\b)/.test(
+      t,
+    )
+  )
+    return true;
+  if (
+    /\b(styrketr\w*ning|styrkeøkter|styrkeøkt|gym\w*program|gym\w*plan|vekter?|knebøy|markløft|benkpress|pull[\s-]+up|pullups?|chin[\s-]+up)\b/.test(
+      t,
+    ) &&
+    /program|plan|uker|uke|økter?|sjekkliste|gym|per uke|i uken|flere uker|ukentlig/.test(t)
+  ) {
+    if (/\b(kun|bare|hovedsakelig|først|primært)\b[^.!?\n]{0,30}\bløpe?/.test(t) && !/\bstyrke/.test(t)) return false;
+    if (/\bløpeprogram\w*|\bløpe\s+program/.test(t) && !/\bstyrke/.test(t)) return false;
+    return true;
+  }
+  if (
+    /\b(styrk|gym|vekter?)\b/.test(t) &&
+    /(?:\bmed\b|\bfor\b|\bfokus|til\s+styr|slik at|ønsker|vil ha|mål)\b/.test(t) &&
+    /program|plan|uker|økter?|sjekkliste|økter?\s*per|økter?\s+i/.test(t)
+  ) {
+    if (/(?:\bkun|bare|hovedsakelig)\b[^.!?\n]{0,40}\bløp/i.test(t) && !/\bstyrke/.test(t)) return false;
+    return true;
+  }
+  if (/(?:\bkun|bare|hovedsakelig|primært|fokus|vektpå|vekt\s*på)\b[^.!?\n]{0,50}\bstyrke\b/.test(t) && /program|uker|økt|sjekkliste/.test(t)) return true;
+  if (/(?:\bkun|bare|hovedsakelig)\b[^.!?\n]{0,40}\bstyrke\b/.test(t) && /program|uke|uker|økt|økter|sjekkliste|vekt/.test(t)) return true;
+  if (
+    /(?:\bgym\b|\bvekt\w*|\btyngde\w*|\bknebøy|\bmarkløft)/.test(t) &&
+    /program|ukeplan|uker|økter/.test(t) &&
+    !/\bløpeprogram\w*|\bløpe\s+program/.test(t)
+  )
+    return true;
+  return false;
+}
+
+function chatUserWantsRunningProgram(m) {
+  const t = String(m).toLowerCase();
+  if (/\bløpeprogram\w*|\bløpe\s+program\w*|\bløpeplan\w*|\bløpe\s+plan\w*|\bintervallprogram\w*|\bmosjon(?:s)?løp\w*|\b(løp|løping|løpetur\w*)\b[^.!?\n]{0,30}\bprogram\b/.test(t)) return true;
+  if (/(?:\boppret\w*|\blag\w*|\bbygg\w*|\bbygge\w*|\bgi\w*|\bgi meg\w*|\bskap\w*|\btreng\w*|\bønsker\w*|\bber om\w*|\bkan du\w*)\b[^.!?\n]{0,100}\b(?:et\s+)?løpe?program\w?/.test(t)) return true;
+  if (/(?:\bintervall|fartlek|terkel|terskel|langtur|mengde|rolig\w* løp|konkurrans\w* løp|10\s*km|5\s*km|maraton|halvmaraton)\b/.test(t) && /\bprogram|ukeplan|flere uker|uker med/.test(t) && !/\bstyrkeprogram|\bstyrke\s+program|\bfokus.*styrke\b/.test(t)) return true;
+  return false;
+}
+
+function chatUserWantsProgramKindAmbiguous(message, st, run) {
+  if (st || run) return false;
+  const t = String(message).toLowerCase();
+  if (!t.trim()) return false;
+  const programny = /treningsprogram|sjekkliste|ukeplan|flere\s*uker|\b\d{1,2}\s*uker\b|programmet|treningsplan|per uke|økter?\s*per|økter?\s+i\s*uken|over\s+\d{1,2}\s*uker|plan\s+over|uke\s*for\s*uke|uke-for-uke|lag(?:ge|et)\s+plan|l(?:age|ar)\s+et\s+program|nytt\s+program|et\s+program/.test(
+    t,
+  );
+  if (!programny) return false;
+  if (/\b(styrk|gym|vekter?|knebøy|kne-?bøy|markløft|styrketr)/.test(t)) return false;
+  if (/\b(løpe|løping|løp\s|løptur|intervall|terkel|5\s*km|10\s*km|maraton|halvmaraton|mosjon\w*løp|konkurranse\w*løp|rolig\w*løp)\b/.test(t)) return false;
+  return true;
+}
+
+/**
+ * @param {string} [programIntentHint] 'strength' | 'running' | 'unspecified' — som klienten (App) beregner, samme logikk som systemprompt
+ */
+function userMeantStrengthFromChat(lastUser, programIntentHint) {
+  if (programIntentHint === 'strength') return true;
+  if (programIntentHint === 'running') return false;
+  return chatUserWantsStrengthProgram(lastUser) && !chatUserWantsRunningProgram(lastUser);
+}
+
+function userMeantRunningFromChat(lastUser, programIntentHint) {
+  if (programIntentHint === 'running') return true;
+  if (programIntentHint === 'strength') return false;
+  return chatUserWantsRunningProgram(lastUser) && !chatUserWantsStrengthProgram(lastUser);
+}
+
+function programRequestNeedsClarify(lastUser, programIntentHint) {
+  if (programIntentHint === 'strength' || programIntentHint === 'running') return false;
+  const st = chatUserWantsStrengthProgram(lastUser);
+  const run = chatUserWantsRunningProgram(lastUser);
+  return chatUserWantsProgramKindAmbiguous(lastUser, st, run);
+}
+
+/**
+ * Når styrke/løp er tydelig i brukertekst men modell valgte feil verktøy: ett nytt (ikke-stream) kall.
+ */
+async function correctProgramToolIfMismatch(messages, firstMsg, tools, programIntentHint = 'unspecified') {
+  const t0 = firstMsg?.tool_calls?.[0];
+  const n0 = t0?.function?.name;
+  if (n0 !== 'create_running_program' && n0 !== 'create_strength_program') {
+    return { action: 'ok', message: firstMsg };
+  }
+  const lastUser = getLastUserTextFromChatMessages(messages);
+  if (programRequestNeedsClarify(lastUser, programIntentHint)) {
+    return { action: 'clarify', text: PROGRAM_KIND_CLARIFY_REPLY };
+  }
+  if (n0 === 'create_running_program' && userMeantStrengthFromChat(lastUser, programIntentHint)) {
+    const appHintLine =
+      programIntentHint === 'strength'
+        ? ' Appen sendte programIntentHint=strength — du må kalle create_strength_program, aldri create_running_program nå.'
+        : '';
+    const fix = await getOpenAI().chat.completions.create({
+      model: OPENAI_MODEL,
+      messages: [
+        ...messages,
+        {
+          role: 'system',
+          content:
+            'KORREKSJON: Siste brukermelding gjelder styrke / gym / styrkeprogram. Kall create_strength_program (ikke create_running_program) med hele programmet, sessions kun styrkeøkter, alle uker 1..weeks.' +
+            appHintLine,
+        },
+      ],
+      tools,
+      max_completion_tokens: CHAT_TOOL_MAX_COMPLETION_TOKENS,
+    });
+    const m2 = fix.choices?.[0]?.message;
+    const t2 = m2?.tool_calls?.[0];
+    if (t2?.function?.name === 'create_strength_program') {
+      console.log('[/chat] corrected running→strength tool from user text');
+      return { action: 'ok', message: m2 };
+    }
+    return { action: 'clarify', text: PROGRAM_KIND_RETRY_FAIL_REPLY };
+  }
+  if (n0 === 'create_strength_program' && userMeantRunningFromChat(lastUser, programIntentHint)) {
+    const appHintLine =
+      programIntentHint === 'running'
+        ? ' Appen sendte programIntentHint=running — du må kalle create_running_program, aldri create_strength_program nå.'
+        : '';
+    const fix = await getOpenAI().chat.completions.create({
+      model: OPENAI_MODEL,
+      messages: [
+        ...messages,
+        {
+          role: 'system',
+          content:
+            'KORREKSJON: Siste brukermelding gjelder løpeprogram. Kall create_running_program (ikke create_strength_program) med hele løpeprogrammet, sessions kun løpeøkter, alle uker 1..weeks.' +
+            appHintLine,
+        },
+      ],
+      tools,
+      max_completion_tokens: CHAT_TOOL_MAX_COMPLETION_TOKENS,
+    });
+    const m2 = fix.choices?.[0]?.message;
+    const t2 = m2?.tool_calls?.[0];
+    if (t2?.function?.name === 'create_running_program') {
+      console.log('[/chat] corrected strength→running tool from user text');
+      return { action: 'ok', message: m2 };
+    }
+    return { action: 'clarify', text: PROGRAM_KIND_RETRY_FAIL_REPLY };
+  }
+  return { action: 'ok', message: firstMsg };
+}
+
 // ---- Chat API --------------------------------------------------------------
 const ChatRequestSchema = z.object({
   messages: z
@@ -936,6 +1279,7 @@ const ChatRequestSchema = z.object({
       }),
     )
     .min(1),
+  programIntentHint: z.enum(['strength', 'running', 'unspecified']).optional(),
 });
 
 app.post('/chat/stream', requireAuth, async (req, res) => {
@@ -994,9 +1338,48 @@ app.post('/chat/stream', requireAuth, async (req, res) => {
         } catch {
           parsedArgs = {};
         }
-        send('tool_call', { name: toolCallName, args: parsedArgs });
+        const firstStreamMsg = {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            {
+              id: toolCallId,
+              type: 'function',
+              function: { name: toolCallName, arguments: toolCallArgs || '{}' },
+            },
+          ],
+        };
+        const pre = await correctProgramToolIfMismatch(
+          parse.data.messages,
+          firstStreamMsg,
+          getTools(),
+          parse.data.programIntentHint ?? 'unspecified',
+        );
+        if (pre.action === 'clarify' && pre.text) {
+          send('final', { text: pre.text });
+          send('done', { ok: true });
+          res.end();
+          return;
+        }
+        const fixedMsg = pre.message;
+        const tc0 = fixedMsg?.tool_calls?.[0];
+        if (!tc0?.function?.name) {
+          send('error', { message: 'Uventet svar (mangler verktøy etter retting).' });
+          res.end();
+          return;
+        }
+        const useName = tc0.function.name;
+        const useId = tc0.id;
+        const useArgStr = tc0.function.arguments || '{}';
+        let useArgs = {};
+        try {
+          useArgs = useArgStr ? JSON.parse(useArgStr) : {};
+        } catch {
+          useArgs = {};
+        }
+        send('tool_call', { name: useName, args: useArgs });
 
-        const toolResult = await safeRunToolCall(toolCallName, parsedArgs, { userId: req.user.id });
+        const toolResult = await safeRunToolCall(useName, useArgs, { userId: req.user.id });
         send('tool_result', toolResult);
 
         const followUp = await getOpenAI().chat.completions.create({
@@ -1005,21 +1388,12 @@ app.post('/chat/stream', requireAuth, async (req, res) => {
             ...parse.data.messages,
             {
               role: 'assistant',
-              content: null,
-              tool_calls: [
-                {
-                  id: toolCallId,
-                  type: 'function',
-                  function: {
-                    name: toolCallName,
-                    arguments: toolCallArgs || '{}',
-                  },
-                },
-              ],
+              content: fixedMsg.content ?? null,
+              tool_calls: fixedMsg.tool_calls,
             },
             {
               role: 'tool',
-              tool_call_id: toolCallId,
+              tool_call_id: useId,
               content: JSON.stringify(toolResult),
             },
           ],
@@ -1029,7 +1403,11 @@ app.post('/chat/stream', requireAuth, async (req, res) => {
         let outText = followUp.choices?.[0]?.message?.content || '';
         if (!outText.trim() && toolResult?.kind === 'running_program') {
           outText =
-            'Her er løpeprogrammet ditt. Trykk «Lagre som løpeprogram» under forslaget for å bruke det under fanen Løpeprogram.';
+            'Her er løpeprogrammet ditt. Trykk «Lagre som løpeprogram» under forslaget for å bruke det under Program-fanen (Løpeprogram).';
+        }
+        if (!outText.trim() && toolResult?.kind === 'strength_program') {
+          outText =
+            'Her er styrkeprogrammet. Trykk «Lagre som styrkeprogram» under forslaget for å bruke det under Program-fanen (Styrkeprogram).';
         }
         if (!outText.trim() && toolResult?.kind === 'tool_card') {
           outText = 'Her er et kort svar fra verktøyet (se boksen under).';
@@ -1069,10 +1447,26 @@ app.post('/chat', requireAuth, async (req, res) => {
     });
     console.log(`[/chat] OpenAI returned (finish_reason=${first.choices?.[0]?.finish_reason})`);
 
-    const msg = first.choices?.[0]?.message;
+    let msg = first.choices?.[0]?.message;
     if (!msg) {
       res.status(500).json({ error: 'No model output' });
       return;
+    }
+
+    if (msg.tool_calls && msg.tool_calls.length > 0) {
+      const pre = await correctProgramToolIfMismatch(
+        parse.data.messages,
+        msg,
+        tools,
+        parse.data.programIntentHint ?? 'unspecified',
+      );
+      if (pre.action === 'clarify' && pre.text) {
+        res.json({ text: pre.text, toolResult: undefined });
+        return;
+      }
+      if (pre.action === 'ok' && pre.message) {
+        msg = pre.message;
+      }
     }
 
     if (msg.tool_calls && msg.tool_calls.length > 0) {
@@ -1113,7 +1507,11 @@ app.post('/chat', requireAuth, async (req, res) => {
       let outText = followUp.choices?.[0]?.message?.content || '';
       if (!outText.trim() && toolResult?.kind === 'running_program') {
         outText =
-          'Her er løpeprogrammet ditt. Trykk «Lagre som løpeprogram» under forslaget for å bruke det under fanen Løpeprogram.';
+          'Her er løpeprogrammet ditt. Trykk «Lagre som løpeprogram» under forslaget for å bruke det under Program-fanen (Løpeprogram).';
+      }
+      if (!outText.trim() && toolResult?.kind === 'strength_program') {
+        outText =
+          'Her er styrkeprogrammet. Trykk «Lagre som styrkeprogram» under forslaget for å bruke det under Program-fanen (Styrkeprogram).';
       }
       if (!outText.trim() && toolResult?.kind === 'tool_card') {
         outText = 'Her er et kort svar fra verktøyet (se boksen under).';
