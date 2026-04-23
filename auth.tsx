@@ -244,6 +244,10 @@ async function readStoredServerUrl(): Promise<string> {
 let onUnauthenticated: (() => void) | null = null;
 let getServerBase: () => string = () => resolveDefaultServerUrl();
 
+/** Unngå at mange parallelle 401-respons starter hver sin /auth/anonymous (Vercel-støy). */
+let authRecoveryBusy = false;
+let authRecoveryCooldownUntil = 0;
+
 export type ApiFetchOptions = RequestInit & {
   /** Pass en annen base URL (default: context-verdien). */
   base?: string;
@@ -382,14 +386,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await applyAuth({ sessionToken: data.sessionToken, user: data.user });
   }, [applyAuth]);
 
-  // Globalt 401-håndtak: opprett ny anonym økt (ingen innloggingsskjerm).
+  // Globalt 401-håndtak: opprett ny anonym økt (én om gangen + kort cooldown).
   useEffect(() => {
     onUnauthenticated = () => {
+      const now = Date.now();
+      if (authRecoveryBusy || now < authRecoveryCooldownUntil) return;
+      authRecoveryBusy = true;
+      authRecoveryCooldownUntil = now + 2500;
       void (async () => {
         try {
           await bootstrapAnonymous();
         } catch {
           await applyAuth({ sessionToken: null, user: null });
+        } finally {
+          authRecoveryBusy = false;
         }
       })();
     };

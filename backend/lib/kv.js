@@ -32,8 +32,12 @@ if (REDIS_URL && REDIS_TOKEN) {
     realRedis = null;
   }
 } else if (process.env.VERCEL) {
-  console.warn(
-    '[kv] KV_REST_API_URL/KV_REST_API_TOKEN (eller UPSTASH_REDIS_REST_URL/TOKEN) mangler på Vercel – bruker in-memory fallback. Auth og Strava-tokens vil IKKE overleve funksjons-restart.',
+  console.error(
+    [
+      '[kv] PRODUKSJON: Mangler Redis på Vercel. Sett KV_REST_API_URL + KV_REST_API_TOKEN',
+      '(eller UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN) fra Upstash.',
+      'Uten dette har hver serverless-instans eget minne → tilfeldige 401, Strava feiler, gjentatte POST /auth/anonymous.',
+    ].join(' '),
   );
 }
 

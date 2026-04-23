@@ -75,7 +75,20 @@ app.use((req, _res, next) => {
   next();
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/health', async (_req, res) => {
+  const { isUsingRealKv } = await import('./lib/kv.js');
+  const kvPersistent = isUsingRealKv();
+  const payload = {
+    ok: true,
+    kvPersistent,
+    vercel: Boolean(process.env.VERCEL),
+  };
+  if (process.env.VERCEL && !kvPersistent) {
+    payload.warning =
+      'Add Upstash Redis: set KV_REST_API_URL and KV_REST_API_TOKEN in Vercel project env (see /backend/lib/kv.js). Without this, auth and Strava break across instances.';
+  }
+  res.json(payload);
+});
 
 // ---- Strava helpers --------------------------------------------------------
 /** På Vercel/serverless er req.protocol ofte "http" uten forwarded headers; Strava krever https + eksakt matchende host. */
