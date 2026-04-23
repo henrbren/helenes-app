@@ -23,9 +23,11 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
 let openaiClient = null;
 function getOpenAI() {
-  const key = process.env.OPENAI_API_KEY;
+  const key = (process.env.OPENAI_API_KEY || process.env.OPENAI || '').trim();
   if (!key) {
-    throw new Error('Missing OPENAI_API_KEY (sett i Vercel Environment Variables eller backend/.env)');
+    throw new Error(
+      'Mangler OpenAI-nøkkel. Sett OPENAI_API_KEY eller OPENAI i Vercel → Environment Variables (eller backend/.env).',
+    );
   }
   if (!openaiClient) openaiClient = new OpenAI({ apiKey: key });
   return openaiClient;
