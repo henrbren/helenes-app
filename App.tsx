@@ -62,7 +62,23 @@ const tabIcons: Record<Tab, string> = {
 
 const SERVER_PORT = 8787;
 
+/** Normaliser base-URL (trim, ingen trailing slash). */
+function normalizeApiBase(url: string): string {
+  return url.trim().replace(/\/$/, '');
+}
+
+/**
+ * Når satt ved build (f.eks. Vercel), brukes alltid denne mot backend.
+ * Sett `EXPO_PUBLIC_API_URL=https://api.dittdomene.no` i Vercel → Environment Variables.
+ */
+function apiBaseFromEnv(): string | null {
+  const v = process.env.EXPO_PUBLIC_API_URL?.trim();
+  return v ? normalizeApiBase(v) : null;
+}
+
 function resolveDefaultServerUrl(): string {
+  const fromEnv = apiBaseFromEnv();
+  if (fromEnv) return fromEnv;
   const hostUri =
     (Constants.expoConfig as any)?.hostUri ||
     (Constants as any)?.expoGoConfig?.debuggerHost ||
@@ -502,6 +518,8 @@ function describeStravaActivityShortLine(a: StravaActivity): string {
 }
 
 async function getServerUrl(): Promise<string> {
+  const fromEnv = apiBaseFromEnv();
+  if (fromEnv) return fromEnv;
   try {
     const raw = await AsyncStorage.getItem(CHAT_CONFIG_KEY);
     if (raw) {

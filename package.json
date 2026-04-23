@@ -6,7 +6,9 @@
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "build": "expo export --platform web",
+    "build:web": "expo export --platform web"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.2.0",
@@ -26,6 +28,9 @@
     "react-native-reanimated": "~4.1.1",
     "react-native-svg": "15.12.1",
     "react-native-web": "^0.21.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   },
   "devDependencies": {
     "@expo/ngrok": "^4.1.3",
