@@ -813,7 +813,7 @@ function StravaCard({
     setError(null);
     setNeedsAuth(false);
     try {
-      const resp = await apiFetch('/strava/recent?days=14');
+      const resp = await apiFetch('/strava/recent?days=14', { ignoreAuthFailure: true });
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) {
         const msg = String((body as any)?.error || `HTTP ${resp.status}`);
@@ -1170,6 +1170,7 @@ function StravaActivityDetailModal({
       try {
         const resp = await apiFetch(
           `/strava/activity/${activity.id}/streams?keys=heartrate,velocity_smooth,distance,time`,
+          { ignoreAuthFailure: true },
         );
         const body = await resp.json().catch(() => ({}));
         if (!resp.ok) {
@@ -1772,7 +1773,7 @@ function StravaStatsCard({
     setIsLoading(true);
     setError(null);
     try {
-      const resp = await apiFetch('/strava/stats');
+      const resp = await apiFetch('/strava/stats', { ignoreAuthFailure: true });
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) throw new Error(String((body as any)?.error || `HTTP ${resp.status}`));
       const fresh: StravaStats = { ...(body as StravaStats), fetchedAt: Date.now() };
@@ -2024,10 +2025,10 @@ function StravaBestEffortsCard({
   const fetchSnapshot = useCallback(
     async (force: boolean): Promise<StravaBestEfforts> => {
       const suffix = force ? '?batch=25&force=1' : '';
-      const resp = await apiFetch(
-        `/strava/best-efforts${suffix}`,
-        { timeoutMs: 15000 },
-      );
+      const resp = await apiFetch(`/strava/best-efforts${suffix}`, {
+        timeoutMs: 15000,
+        ignoreAuthFailure: true,
+      });
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) {
         throw new Error(String((body as any)?.error || `HTTP ${resp.status}`));
@@ -4105,7 +4106,7 @@ const ChatTab = React.forwardRef<
                     keysToClear.map((k) => AsyncStorage.removeItem(k).catch(() => undefined)),
                   );
                   try {
-                    await apiFetch('/strava/best-efforts/reset', { method: 'POST' });
+                    await apiFetch('/strava/best-efforts/reset', { method: 'POST', ignoreAuthFailure: true });
                   } catch {
                     // ignore — local clear already happened
                   }

@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -300,8 +300,13 @@ export async function apiFetch(path: string, options: ApiFetchOptions = {}): Pro
   }
   const signal = options.signal || controller.signal;
 
+  const fetchInit: RequestInit = { ...options, headers, signal };
+  // Same-origin web (Vercel): send httpOnly __session-cookie i tillegg til Bearer (Strava redirect setter cookie).
+  if (Platform.OS === 'web' && typeof url === 'string' && url.startsWith('/')) {
+    fetchInit.credentials = 'include';
+  }
   try {
-    const resp = await fetch(url, { ...options, headers, signal });
+    const resp = await fetch(url, fetchInit);
     if (
       resp.status === 401 &&
       !options.skipAuth &&
@@ -375,6 +380,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [sessionToken, setSessionTokenState] = useState<string | null>(null);
   const [serverUrl, setServerUrlState] = useState<string>(() => resolveDefaultServerUrl());
+  /** Hindrer at en eldre bootstrap-runde kaller applyAuth(null) etter at en nyere runde har logget inn. */
+  const bootstrapSeqRef = useRef(0);
 
   // Under status === 'loading' kan bootstrap sette currentSessionToken før React state er oppdatert;
   // ikke nullstill modul-nivå token da — ellers mister apiFetch Authorization midt i /auth/me.
@@ -433,6 +440,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   // Første oppstart: valider lagret token, ellers innloggingsskjerm (e-post/passord eller gjest).
   useEffect(() => {
+    const seq = ++bootstrapSeqRef.current;
     (async () => {
       const [{ sessionToken: storedToken, user: storedUser }, savedServer] = await Promise.all([
         loadStoredAuth(),
@@ -533,6 +541,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           // ignore
         }
       }
+
+      if (bootstrapSeqRef.current !== seq) return;
+
+      const rescan = await loadStoredAuth();
+      if (rescan.sessionToken) {
+        const retry = await tryApplyValidSession(rescan.sessionToken);
+        if (retry === 'ok') {
+          clearOAuthReturnFromBrowser();
+          return;
+        }
+      }
+
+      if (bootstrapSeqRef.current !== seq) return;
       await applyAuth({ sessionToken: null, user: null });
     })();
   }, [applyAuth]);
