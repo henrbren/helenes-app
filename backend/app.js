@@ -536,7 +536,7 @@ function getTools() {
       function: {
         name: 'create_running_program',
         description:
-          'Lag et strukturert løpeprogram med én rad per planlagt økt. Kun løpeøkter i sessions — hver rad er én løpeøkt med workout_type som tittel. Ikke legg styrke, core, gym eller «etter løpetur: styrke» inn i noen økts description; det tilhører ikke løpesjekklisten. Eventuell styrkeanbefaling kan du skrive i det vanlige chat-svaret, ikke i verktøydata. Fyll sessions sortert etter uke (uke 1 først). Detaljer (varighet, distanse, intensitet, puls, struktur) kun i description. Når brukeren nettopp har oppgitt konkurranse/dato i chat, skal main_race_date følge det — ikke en eldre dato fra lagrede programmer i systemkontekst. Viktig: når main_race_date er satt, skal weeks aldri være større enn antall uker fra i dag til konkurransen (ca. ceil(dager/7) fra nåværende dato i Norge); programmet skal ikke fortsette etter konkurranseuken.',
+          'Lag et strukturert løpeprogram med én rad per planlagt økt. Kun løpeøkter i sessions — hver rad er én løpeøkt med workout_type som tittel. Ikke legg styrke, core, gym eller «etter løpetur: styrke» inn i noen økts description; det tilhører ikke løpesjekklisten. Eventuell styrkeanbefaling kan du skrive i det vanlige chat-svaret, ikke i verktøydata. Fyll sessions sortert etter uke (uke 1 først). Detaljer (varighet, distanse, intensitet, puls, struktur) kun i description. Antall økter per uke (f.eks. «4 økter») er aldri feltet weeks — weeks er kun antall uker i programmet. Når brukeren nettopp har oppgitt konkurranse/dato i chat, skal main_race_date følge det — ikke en eldre dato fra lagrede programmer i systemkontekst. Viktig: når main_race_date er satt, skal weeks aldri være større enn antall uker fra i dag til konkurransen (ca. ceil(dager/7) fra nåværende dato i Norge); programmet skal ikke fortsette etter konkurranseuken. Når brukeren ber om program frem til den datoen (ikke uttrykkelig bare «siste N uker før»), skal weeks normalt være nøyaktig dette antallet uker, ikke et mindre tall som feiltolkning av økter/uke.',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -546,7 +546,7 @@ function getTools() {
             weeks: {
               type: 'number',
               description:
-                'Antall uker programmet varer (1–52). Hvis main_race_date er satt: maks antall uker til og med uken med konkurransen (teller fra i dag, Norge-tid); ikke lengre.',
+                'Antall uker programmet varer (1–52) — ikke antall økter per uke. Hvis main_race_date er satt: maks antall uker til og med uken med konkurransen (teller fra i dag, Norge-tid); ikke lengre. Ved «frem til konkurransedato» skal weeks som regel være nøyaktig dette maks-antallet (med mindre brukeren eksplisitt ba om færre uker).',
             },
             main_race_name: {
               type: 'string',
