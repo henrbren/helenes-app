@@ -68,6 +68,42 @@ function normalizeApiBase(url: string): string {
 }
 
 /**
+ * Bygger URL til fetch. På prod-web bruker vi relative stier (/chat) når base er tom eller lik
+ * sidens origin — da unngår vi CORS/host-mismatch som gir «Failed to fetch».
+ */
+function joinApiUrl(base: string, pathWithQuery: string): string {
+  const path = pathWithQuery.startsWith('/') ? pathWithQuery : `/${pathWithQuery}`;
+  if (
+    Platform.OS === 'web' &&
+    !__DEV__ &&
+    typeof window !== 'undefined' &&
+    window.location?.origin
+  ) {
+    const origin = normalizeApiBase(window.location.origin);
+    const b = base.trim();
+    if (!b || normalizeApiBase(b) === origin) {
+      return path;
+    }
+  }
+  const prefix = base.trim() ? normalizeApiBase(base) : '';
+  return prefix ? `${prefix}${path}` : path;
+}
+
+/** Absolutt https-URL for Linking.openURL (web trenger full URL, ikke /strava/... alene). */
+function absoluteApiUrl(base: string, pathWithQuery: string): string {
+  const path = pathWithQuery.startsWith('/') ? pathWithQuery : `/${pathWithQuery}`;
+  if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location?.origin) {
+    const origin = normalizeApiBase(window.location.origin);
+    const b = base.trim();
+    if (!b || normalizeApiBase(b) === origin) {
+      return `${origin}${path}`;
+    }
+  }
+  const prefix = base.trim() ? normalizeApiBase(base) : '';
+  return prefix ? `${prefix}${path}` : path;
+}
+
+/**
  * Når satt ved build (f.eks. Vercel), brukes alltid denne mot backend.
  * Sett `EXPO_PUBLIC_API_URL=https://api.dittdomene.no` i Vercel → Environment Variables.
  */
@@ -644,7 +680,7 @@ function StravaCard({
     setNeedsAuth(false);
     try {
       const base = await getServerUrl();
-      const resp = await fetch(`${base}/strava/recent?days=14`);
+      const resp = await fetch(joinApiUrl(base, '/strava/recent?days=14'));
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) {
         const msg = String((body as any)?.error || `HTTP ${resp.status}`);
@@ -1001,7 +1037,10 @@ function StravaActivityDetailModal({
       try {
         const base = await getServerUrl();
         const resp = await fetch(
-          `${base}/strava/activity/${activity.id}/streams?keys=heartrate,velocity_smooth,distance,time`,
+          joinApiUrl(
+            base,
+            `/strava/activity/${activity.id}/streams?keys=heartrate,velocity_smooth,distance,time`,
+          ),
         );
         const body = await resp.json().catch(() => ({}));
         if (!resp.ok) {
@@ -1603,7 +1642,7 @@ function StravaStatsCard({
     setError(null);
     try {
       const base = await getServerUrl();
-      const resp = await fetch(`${base}/strava/stats`);
+      const resp = await fetch(joinApiUrl(base, '/strava/stats'));
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) throw new Error(String((body as any)?.error || `HTTP ${resp.status}`));
       const fresh: StravaStats = { ...(body as StravaStats), fetchedAt: Date.now() };
@@ -1855,7 +1894,7 @@ function StravaBestEffortsCard({
       const base = await getServerUrl();
       const suffix = force ? '?batch=25&force=1' : '';
       const resp = await fetchWithTimeout(
-        `${base}/strava/best-efforts${suffix}`,
+        joinApiUrl(base, `/strava/best-efforts${suffix}`),
         {},
         15000,
       );
@@ -3564,7 +3603,7 @@ const ChatTab = React.forwardRef<
           const timeoutId = setTimeout(() => controller.abort(), 45000);
           let resp: Response;
           try {
-            resp = await fetch(`${serverUrl}/chat/session-feedback`, {
+            resp = await fetch(joinApiUrl(serverUrl, '/chat/session-feedback'), {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -3653,7 +3692,7 @@ const ChatTab = React.forwardRef<
       const timeoutId = setTimeout(() => controller.abort(), 45000);
       let resp: Response;
       try {
-        resp = await fetch(`${serverUrl}/chat`, {
+        resp = await fetch(joinApiUrl(serverUrl, '/chat'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -3699,13 +3738,16 @@ const ChatTab = React.forwardRef<
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } catch (e: any) {
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      const hint =
+        Platform.OS === 'web'
+          ? 'På web: prøv å laste siden på nytt. Sjekk at https://…/health svarer med {"ok":true}.'
+          : 'På iPhone: Chat → Innstillinger → sett server-URL til https://ditt-prosjekt.vercel.app (eller kjør backend på Mac og bruk Mac-ens IP:8787 på samme Wi‑Fi).';
       setMessages((prev) => [
         {
           id: `${Date.now()}-err`,
           role: 'assistant',
           text:
-            `Jeg fikk ikke kontakt med chat-serveren.\n\n` +
-            `Sjekk at serveren kjører på Mac-en (port 8787) og at adressen stemmer.\n\n` +
+            `Jeg fikk ikke kontakt med chat-serveren.\n\n${hint}\n\n` +
             `Feil: ${String(e?.message || e)}`,
           createdAt: Date.now(),
         },
@@ -3909,7 +3951,7 @@ const ChatTab = React.forwardRef<
                 onPress={async () => {
                   void Haptics.selectionAsync();
                   try {
-                    const resp = await fetch(`${serverUrl}/health`);
+                    const resp = await fetch(joinApiUrl(serverUrl, '/health'));
                     if (resp.ok) {
                       Alert.alert('Tilkoblet', `Serveren svarer på ${serverUrl}.`);
                     } else {
@@ -3939,7 +3981,7 @@ const ChatTab = React.forwardRef<
                   onPress={async () => {
                     void Haptics.selectionAsync();
                     try {
-                      await Linking.openURL(`${serverUrl}/strava/connect`);
+                      await Linking.openURL(absoluteApiUrl(serverUrl, '/strava/connect'));
                     } catch (e: any) {
                       Alert.alert('Kunne ikke åpne Strava', String(e?.message || e));
                     }
@@ -3960,7 +4002,7 @@ const ChatTab = React.forwardRef<
                     ]);
                     try {
                       const base = await getServerUrl();
-                      await fetch(`${base}/strava/best-efforts/reset`, { method: 'POST' });
+                      await fetch(joinApiUrl(base, '/strava/best-efforts/reset'), { method: 'POST' });
                     } catch {
                       // ignore — local clear already happened
                     }
