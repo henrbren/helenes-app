@@ -3497,13 +3497,23 @@ const ChatTab = React.forwardRef<
         if (rawCfg) {
           const cfg = JSON.parse(rawCfg) as { serverUrl?: string };
           if (cfg?.serverUrl) {
-            const savedIsLocalhost = /(localhost|127\.0\.0\.1)/.test(cfg.serverUrl);
-            const detected = resolveDefaultServerUrl();
-            const detectedIsLan = !/(localhost|127\.0\.0\.1)/.test(detected);
-            // If we're on a physical device (auto-detected URL is on the LAN), always
-            // prefer the freshly detected LAN URL — saved URL may point to localhost or
-            // a stale IP from a previous dev session.
-            setServerUrl(detectedIsLan ? detected : savedIsLocalhost ? detected : cfg.serverUrl);
+            // HTTPS-side som https://*.vercel.app kan ikke kalle http:// (mixed content) → Failed to fetch.
+            const pageHttps =
+              Platform.OS === 'web' &&
+              !__DEV__ &&
+              typeof window !== 'undefined' &&
+              window.location.protocol === 'https:';
+            if (pageHttps && /^http:\/\//i.test(cfg.serverUrl)) {
+              setServerUrl(normalizeApiBase(window.location.origin));
+            } else {
+              const savedIsLocalhost = /(localhost|127\.0\.0\.1)/.test(cfg.serverUrl);
+              const detected = resolveDefaultServerUrl();
+              const detectedIsLan = !/(localhost|127\.0\.0\.1)/.test(detected);
+              // If we're on a physical device (auto-detected URL is on the LAN), always
+              // prefer the freshly detected LAN URL — saved URL may point to localhost or
+              // a stale IP from a previous dev session.
+              setServerUrl(detectedIsLan ? detected : savedIsLocalhost ? detected : cfg.serverUrl);
+            }
           }
         }
 

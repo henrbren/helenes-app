@@ -34,6 +34,19 @@ function getOpenAI() {
 const app = express();
 if (process.env.VERCEL) {
   app.set('trust proxy', 1);
+  // vercel.json rewrites /chat → /api/server; innbakt path kan bli /api/server så Express matcher ikke /chat.
+  app.use((req, _res, next) => {
+    const internal = req.url || '';
+    const original = req.originalUrl || internal;
+    if (
+      (internal === '/api/server' || internal.startsWith('/api/server?')) &&
+      original !== internal &&
+      !String(original).startsWith('/api/server')
+    ) {
+      req.url = original;
+    }
+    next();
+  });
 }
 
 app.use(cors());
