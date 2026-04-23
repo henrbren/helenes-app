@@ -35,6 +35,11 @@ import {
 
 const PORT = Number(process.env.PORT || 8787);
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+/** Gir modell nok plass til lange create_running_program-JSON (alle uker × økter). */
+const CHAT_TOOL_MAX_COMPLETION_TOKENS = Math.min(
+  16384,
+  Math.max(2048, Number(process.env.CHAT_MAX_COMPLETION_TOKENS || 8192)),
+);
 
 let openaiClient = null;
 function getOpenAI() {
@@ -556,7 +561,7 @@ function getTools() {
             sessions: {
               type: 'array',
               description:
-                'Kun løpeøkter (typisk 3–6 per uke). Hver økt har workout_type som tittel. Ingen styrke-/core-/gym-notater i description — bare innhold for selve løpeøkta.',
+                'Kun løpeøkter (typisk 3–6 per uke). Du MÅ fylle inn alle uker 1..weeks: minst én økt per uke (hele blokken, ikke bare første par uker). Hver økt har workout_type som tittel. Ingen styrke-/core-/gym-notater i description — bare innhold for selve løpeøkta.',
               items: {
                 type: 'object',
                 additionalProperties: false,
@@ -672,6 +677,17 @@ function capRunningProgramToRaceDate(weeks, sessions, raceYmd) {
   }
   const nextSessions = sessions.filter((s) => s.week <= cap);
   return { weeks: cap, sessions: nextSessions, wasCapped: true };
+}
+
+/** Minst én økt per uke 1..weeks (full sjekkliste, ikke bare et utdrag). */
+function findMissingProgramWeeks(weeks, sessions) {
+  if (weeks < 1) return [];
+  const present = new Set(sessions.map((s) => s.week));
+  const missing = [];
+  for (let w = 1; w <= weeks; w++) {
+    if (!present.has(w)) missing.push(w);
+  }
+  return missing;
 }
 
 /** Fjerner hele linjer som tydelig bare er styrke/core/gym — løpe-sjekklisten skal ikke blande inn det. */
@@ -818,6 +834,24 @@ async function runToolCall(name, args, ctx) {
         };
       }
     }
+
+    const missingWeeks = findMissingProgramWeeks(programWeeks, programSessions);
+    if (missingWeeks.length > 0) {
+      const preview =
+        missingWeeks.length <= 12
+          ? missingWeeks.join(', ')
+          : `${missingWeeks.slice(0, 12).join(', ')} … (+${missingWeeks.length - 12} til)`;
+      return {
+        kind: 'tool_card',
+        title: 'Ufullstendig løpeprogram',
+        bullets: [
+          `Du satte weeks til ${programWeeks}, men det mangler planlagte økter for hele perioden.`,
+          `Mangler minst én økt i uke: ${preview}.`,
+          'Kall create_running_program på nytt med komplett sessions: for hver uke fra 1 til weeks (vanligvis 3–6 løpeøkter per uke). Ikke send bare et kort utdrag — verktøyargumentene må romme hele programmet.',
+        ],
+      };
+    }
+
     return {
       kind: 'running_program',
       title: parsed.title,
@@ -896,6 +930,7 @@ app.post('/chat/stream', requireAuth, async (req, res) => {
       model: OPENAI_MODEL,
       messages: parse.data.messages,
       tools,
+      max_completion_tokens: CHAT_TOOL_MAX_COMPLETION_TOKENS,
       stream: true,
     });
 
@@ -997,6 +1032,7 @@ app.post('/chat', requireAuth, async (req, res) => {
       model: OPENAI_MODEL,
       messages: parse.data.messages,
       tools,
+      max_completion_tokens: CHAT_TOOL_MAX_COMPLETION_TOKENS,
     });
     console.log(`[/chat] OpenAI returned (finish_reason=${first.choices?.[0]?.finish_reason})`);
 
