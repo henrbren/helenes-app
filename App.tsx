@@ -4429,6 +4429,7 @@ function SessionModal({
             </View>
           </View>
 
+
           {isRunning ? (
             <>
               <View style={styles.field}>
