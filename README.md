@@ -32,11 +32,11 @@ npm run ios
 
 ```bash
 export PATH="/Users/helenebergene/Desktop/.local-node/node-v22.22.0-darwin-arm64/bin:$PATH"
-cd "/Users/helenebergene/Desktop/training-log-ios/server"
+cd "/Users/helenebergene/Documents/projects/training-log-ios/backend"
 cp .env.example .env
 ```
 
-Rediger `server/.env` og sett `OPENAI_API_KEY`.
+Rediger `backend/.env` og sett `OPENAI_API_KEY`.
 
 Kjør så:
 

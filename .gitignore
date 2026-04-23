@@ -5,7 +5,9 @@ dist
 # Secrets
 .env
 .env.*
-server/.env
+backend/.env
+backend/.strava-tokens.json
+backend/.strava-best-efforts.json
 
 # Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
 
