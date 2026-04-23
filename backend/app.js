@@ -556,12 +556,12 @@ function getTools() {
             main_race_date: {
               type: 'string',
               description:
-                'Valgfritt: konkurransedato YYYY-MM-DD. Når satt, må weeks og alle session.week være innenfor tidsrommet frem til denne datoen (programmet skal ikke gå utover konkurransen).',
+                'Valgfritt: konkurransedato YYYY-MM-DD. Når satt, må weeks og alle session.week være innenfor tidsrommet frem til denne datoen. Sett session_date på hver økt (kalender); konkurranseøkta skal ha session_date lik denne datoen.',
             },
             sessions: {
               type: 'array',
               description:
-                'Kun løpeøkter (typisk 3–6 per uke). Du MÅ fylle inn alle uker 1..weeks: minst én økt per uke (hele blokken, ikke bare første par uker). Hver økt har workout_type som tittel. Ingen styrke-/core-/gym-notater i description — bare innhold for selve løpeøkta.',
+                'Kun løpeøkter (typisk 3–6 per uke). Du MÅ fylle inn alle uker 1..weeks: minst én økt per uke (hele blokken, ikke bare første par uker). Hver økt har workout_type som tittel. Når main_race_date er satt: fyll session_date (YYYY-MM-DD) for hver økt slik at datoene følger ekte kalender og day_label; siste konkurranseøkt (workout_type «Konkurranse») skal ha session_date lik main_race_date. Ingen styrke-/core-/gym-notater i description — bare innhold for selve løpeøkta.',
               items: {
                 type: 'object',
                 additionalProperties: false,
@@ -570,6 +570,11 @@ function getTools() {
                   day_label: {
                     type: 'string',
                     description: 'Ukedag eller merking, f.eks. "Mandag" eller "Uke 3 · onsdag".',
+                  },
+                  session_date: {
+                    type: 'string',
+                    description:
+                      'Valgfritt men anbefalt når main_race_date finnes: planlagt dato YYYY-MM-DD for denne økta, i tråd med norsk kalender og ukedag i day_label. Konkurranseøkta skal ha samme dato som main_race_date.',
                   },
                   workout_type: {
                     type: 'string',
@@ -635,7 +640,9 @@ function normalizeCreateRunningProgramArgs(args) {
     out.sessions = out.sessions.map((sess) => {
       if (!sess || typeof sess !== 'object') return sess;
       const fixed = coerceRunWorkoutType(sess.workout_type) || 'Rolig løpetur';
-      return { ...sess, workout_type: fixed };
+      const next = { ...sess, workout_type: fixed };
+      if (next.session_date != null && String(next.session_date).trim() === '') delete next.session_date;
+      return next;
     });
   }
   return out;
@@ -688,6 +695,27 @@ function findMissingProgramWeeks(weeks, sessions) {
     if (!present.has(w)) missing.push(w);
   }
   return missing;
+}
+
+function normalizeOptionalYmd(raw) {
+  if (raw == null) return undefined;
+  const s = String(raw).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return undefined;
+  return s;
+}
+
+/** Konkurranse uten dato får main_race_date; ingen økt etter konkurransedato. */
+function enrichRunningProgramSessionDates(sessions, mainRaceDate) {
+  const race = normalizeOptionalYmd(mainRaceDate);
+  return sessions.map((s) => {
+    let d = normalizeOptionalYmd(s.session_date);
+    if (s.workout_type === 'Konkurranse' && race && !d) d = race;
+    if (d && race && d > race) d = race;
+    const out = { ...s };
+    if (d) out.session_date = d;
+    else delete out.session_date;
+    return out;
+  });
 }
 
 /** Fjerner hele linjer som tydelig bare er styrke/core/gym — løpe-sjekklisten skal ikke blande inn det. */
@@ -788,6 +816,7 @@ async function runToolCall(name, args, ctx) {
           z.object({
             week: z.number().int().min(1).max(52),
             day_label: z.string().min(1).max(80),
+            session_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
             workout_type: runWorkoutTypeEnum,
             description: z.string().min(1).max(800),
           }),
@@ -813,6 +842,8 @@ async function runToolCall(name, args, ctx) {
         );
       }
     }
+
+    programSessions = enrichRunningProgramSessionDates(programSessions, parsed.main_race_date);
 
     if (programSessions.length === 0) {
       return {
@@ -864,13 +895,15 @@ async function runToolCall(name, args, ctx) {
       sessions: programSessions.map((s) => {
         const wt = s.workout_type;
         const description = stripStrengthLinesFromRunDescription(s.description);
-        return {
+        const row = {
           week: s.week,
           dayLabel: s.day_label,
           title: wt,
           description,
           workoutType: wt,
         };
+        if (s.session_date) row.date = s.session_date;
+        return row;
       }),
     };
   }
