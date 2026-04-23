@@ -3735,13 +3735,16 @@ function ChecklistProgramTab({
                                 onCopyProgram(p.id);
                                 void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
                               }}
-                              style={({ pressed }) => [styles.sessionEditIconBtn, pressed && { opacity: 0.5 }]}
+                              style={({ pressed }) => [
+                                styles.programCopyIconBtn,
+                                pressed && { opacity: 0.7, backgroundColor: 'rgba(148, 163, 184, 0.2)' },
+                              ]}
                               accessibilityRole="button"
                               accessibilityLabel={`Kopier ${p.title}`}
                               accessibilityHint="Lager en kopi av programmet med ny tittel"
                               hitSlop={8}
                             >
-                              <FontAwesome6 name="copy" size={16} color="#7A3C4A" solid />
+                              <FontAwesome6 name="copy" size={14} color="#94a3b8" solid />
                             </Pressable>
                             <Pressable
                               onPress={() => {
@@ -9771,6 +9774,13 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-start',
     gap: 6,
+  },
+  programCopyIconBtn: {
+    paddingVertical: 3,
+    paddingHorizontal: 5,
+    marginTop: -2,
+    borderRadius: 6,
+    backgroundColor: 'rgba(148, 163, 184, 0.1)',
   },
   sessionEditIconBtn: {
     paddingVertical: 4,
