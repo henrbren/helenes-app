@@ -285,7 +285,15 @@ export async function apiFetch(path: string, options: ApiFetchOptions = {}): Pro
       !options.ignoreAuthFailure &&
       onUnauthenticated
     ) {
-      onUnauthenticated();
+      try {
+        const body = (await resp.clone().json()) as { code?: string };
+        const code = body?.code;
+        if (code === 'UNAUTHENTICATED' || code === 'SESSION_EXPIRED' || code === 'USER_GONE') {
+          onUnauthenticated();
+        }
+      } catch {
+        // Ukjent 401-format — ikke bytt bruker (unngå feil ved f.eks. Strava 401 med annen code).
+      }
     }
     return resp;
   } finally {

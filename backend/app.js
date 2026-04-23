@@ -239,10 +239,15 @@ app.get('/strava/callback', async (req, res) => {
       if (athleteId) {
         await linkStravaToUser(statePayload.userId, { athleteId, athleteName });
       }
+      // Ny sesjon + token i URL slik at web-klienten (etter full redirect) er synket med
+      // server-KV – samme mønster som Strava-login. Uten dette kan gammelt Bearer-token
+      // i AsyncStorage peke på en utløpt/ukjent sesjon etter OAuth.
+      const { token: sessionToken } = await createSession(statePayload.userId);
+      res.setHeader('Set-Cookie', buildSessionCookie(sessionToken));
       res.send(
         successRedirectHtml({
           webBase: '/',
-          queryParams: { strava: 'connected' },
+          queryParams: { auth: 'ok', token: sessionToken, strava: 'connected' },
           message: 'Strava er koblet til kontoen din',
         }),
       );
