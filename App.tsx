@@ -79,6 +79,16 @@ function apiBaseFromEnv(): string | null {
 function resolveDefaultServerUrl(): string {
   const fromEnv = apiBaseFromEnv();
   if (fromEnv) return fromEnv;
+  // Statisk web-export (f.eks. Vercel): API ligger på samme host som siden via rewrites.
+  // Uten dette faller vi tilbake til localhost:8787 og får «Failed to fetch» i nettleseren.
+  if (
+    Platform.OS === 'web' &&
+    typeof window !== 'undefined' &&
+    window.location?.origin &&
+    !__DEV__
+  ) {
+    return normalizeApiBase(window.location.origin);
+  }
   const hostUri =
     (Constants.expoConfig as any)?.hostUri ||
     (Constants as any)?.expoGoConfig?.debuggerHost ||
