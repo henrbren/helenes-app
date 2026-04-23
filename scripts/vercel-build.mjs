@@ -25,6 +25,15 @@ if (result.status !== 0) {
   process.exit(result.status ?? 1);
 }
 
+const patch = spawnSync('node', ['scripts/apply-web-icons.mjs'], {
+  stdio: 'inherit',
+  shell: true,
+  cwd: process.cwd(),
+});
+if (patch.status !== 0) {
+  process.exit(patch.status ?? 1);
+}
+
 // Vercel: ikke bruk bare outputDirectory=dist — da kan /api-funksjoner fra repo bli utelatt.
 // Statiske filer i public/ + api/ i roten er støttet samtidig.
 if (existsSync('public')) rmSync('public', { recursive: true });

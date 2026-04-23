@@ -63,9 +63,20 @@ app.use((req, _res, next) => {
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // ---- Strava routes ---------------------------------------------------------
+/** På Vercel/serverless er req.protocol ofte "http" uten forwarded headers; Strava krever https + eksakt matchende host. */
 function selfBaseUrl(req) {
-  const host = req.get('host');
-  const proto = req.protocol || 'http';
+  const forwardedProto = (req.get('x-forwarded-proto') || '').split(',')[0].trim();
+  const forwardedHost = (req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
+  const proto =
+    forwardedProto || (process.env.VERCEL ? 'https' : (req.protocol === 'https' ? 'https' : 'http'));
+  const host =
+    forwardedHost ||
+    (process.env.VERCEL && process.env.VERCEL_URL
+      ? String(process.env.VERCEL_URL).replace(/^https?:\/\//i, '')
+      : '');
+  if (!host) {
+    return `${proto}://localhost`;
+  }
   return `${proto}://${host}`;
 }
 

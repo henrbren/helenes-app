@@ -107,12 +107,14 @@ function normalizeApiBase(url: string): string {
 }
 
 /**
- * Bygger URL til fetch. På https-sider: aldri kall http:// (mixed content → «Failed to fetch»).
- * Bruk relative stier mot samme host når base er tom, lik origin, eller ugyldig http mot https-side.
+ * Bygger URL til fetch.
+ * - HTTPS-web (Vercel m.fl.): alltid relative sti — API nås via rewrites på samme origin.
+ *   Da ignoreres __DEV__, lagret feil host og EXPO_PUBLIC som peker andre veier (unngår «Failed to fetch»).
+ * - HTTP-web (typisk lokal Expo): full URL mot chatApiBase / Mac:8787 som før.
  */
 function joinApiUrl(base: string, pathWithQuery: string): string {
   const path = pathWithQuery.startsWith('/') ? pathWithQuery : `/${pathWithQuery}`;
-  if (useSameOriginApiOnWeb()) {
+  if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location?.protocol === 'https:') {
     return path;
   }
   if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location?.origin) {
@@ -133,7 +135,7 @@ function joinApiUrl(base: string, pathWithQuery: string): string {
 /** Absolutt https-URL for Linking.openURL (web trenger full URL, ikke /strava/... alene). */
 function absoluteApiUrl(base: string, pathWithQuery: string): string {
   const path = pathWithQuery.startsWith('/') ? pathWithQuery : `/${pathWithQuery}`;
-  if (useSameOriginApiOnWeb() && typeof window !== 'undefined') {
+  if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location?.protocol === 'https:') {
     return `${normalizeApiBase(window.location.origin)}${path}`;
   }
   if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location?.origin) {
@@ -184,27 +186,6 @@ function apiBaseFromEnv(): string | null {
 function apiBaseFromAppExtra(): string | null {
   const u = (Constants.expoConfig?.extra as { apiUrl?: string } | undefined)?.apiUrl?.trim();
   return u ? normalizeApiBase(u) : null;
-}
-
-/**
- * Produksjons-web på HTTPS: API ligger på samme host som siden (Vercel rewrites), med mindre
- * EXPO_PUBLIC_API_URL bevisst peker til en annen host (delt frontend/API).
- * Da bruker vi relative URL-er og unngår cross-origin «Failed to fetch» ved feil lagret host
- * eller utdatert byggesk variabel.
- */
-function useSameOriginApiOnWeb(): boolean {
-  if (Platform.OS !== 'web' || typeof window === 'undefined' || !window.location?.origin) {
-    return false;
-  }
-  if (__DEV__ || window.location.protocol !== 'https:') {
-    return false;
-  }
-  const origin = normalizeApiBase(window.location.origin);
-  const fromEnv = apiBaseFromEnv();
-  if (fromEnv && normalizeApiBase(fromEnv) !== origin) {
-    return false;
-  }
-  return true;
 }
 
 function resolveDefaultServerUrl(): string {
@@ -3883,7 +3864,9 @@ const ChatTab = React.forwardRef<
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       const hint =
         Platform.OS === 'web'
-          ? 'På https-sider kan ikke nettleseren kalle http:// (localhost/Mac) — da blir det «Failed to fetch». Bruk samme domene som siden eller sjekk /health.'
+          ? typeof window !== 'undefined' && window.location?.protocol === 'https:'
+            ? 'Nettverksfeil mot API (skal gå til samme domene). Prøv hard refresh, annen nettleser eller inkognito. Sjekk at /health og POST /chat fungerer fra Vercel.'
+            : 'På https-sider kan ikke nettleseren kalle http:// (localhost/Mac) — da blir det «Failed to fetch». Bruk samme domene som siden eller sjekk /health.'
           : 'På iPhone: Chat → Innstillinger → sett server-URL til https://ditt-prosjekt.vercel.app (eller kjør backend på Mac og bruk Mac-ens IP:8787 på samme Wi‑Fi).';
       setMessages((prev) => [
         {
@@ -4940,6 +4923,31 @@ export default function App() {
       hideSub.remove();
     };
   }, []);
+
+  // I dev (`expo start --web`) injiseres favicon + apple-touch slik Safari får samme ikon som i produksjon.
+  // Bygg (`apply-web-icons.mjs`) legger dette inn i dist/index.html for Vercel.
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined' || !__DEV__) return;
+    if (document.querySelector('link[data-training-log-web-icon]')) return;
+    const touch = document.createElement('link');
+    touch.rel = 'apple-touch-icon';
+    touch.href = '/favicon.png';
+    touch.setAttribute('data-training-log-web-icon', '1');
+    document.head.appendChild(touch);
+    const iconPng = document.createElement('link');
+    iconPng.rel = 'icon';
+    iconPng.type = 'image/png';
+    iconPng.href = '/favicon.png';
+    iconPng.setAttribute('data-training-log-web-icon', '1');
+    document.head.appendChild(iconPng);
+    if (!document.querySelector('meta[name="apple-mobile-web-app-title"]')) {
+      const title = document.createElement('meta');
+      title.setAttribute('name', 'apple-mobile-web-app-title');
+      title.setAttribute('content', 'Treningslogg');
+      document.head.appendChild(title);
+    }
+  }, []);
+
   const [form, setForm] = useState<SessionForm>(createDefaultForm());
   const [sessions, setSessions] = useState<Session[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
