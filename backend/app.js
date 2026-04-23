@@ -61,6 +61,8 @@ if (process.env.VERCEL) {
       !String(original).startsWith('/api/server')
     ) {
       req.url = original;
+      // Uten dette kan req.query forbli tom etter url-justering → Strava-kobling får ikke ?token=.
+      if (req._parsedUrl) delete req._parsedUrl;
     }
     next();
   });

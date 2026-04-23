@@ -84,6 +84,19 @@ function readCookie(req, name) {
  *   2. `__session`-cookie (brukes av web-OAuth-redirects)
  *   3. `?token=` query-param (brukes av Linking.openURL under Strava-kobling)
  */
+function tokenFromUrlQueryString(urlish) {
+  if (!urlish || typeof urlish !== 'string') return null;
+  try {
+    const i = urlish.indexOf('?');
+    if (i < 0) return null;
+    const params = new URLSearchParams(urlish.slice(i + 1));
+    const t = params.get('token');
+    return typeof t === 'string' && t.trim() ? t.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 export function readSessionTokenFromRequest(req) {
   const auth = req.headers?.authorization || req.headers?.Authorization;
   if (typeof auth === 'string' && auth.toLowerCase().startsWith('bearer ')) {
@@ -94,6 +107,11 @@ export function readSessionTokenFromRequest(req) {
   if (cookie) return cookie;
   const q = req.query?.token;
   if (typeof q === 'string' && q.trim()) return q.trim();
+  // Vercel/Express: req.query kan være tom etter intern rewrite — les token fra URL-streng.
+  const fromOriginal = tokenFromUrlQueryString(req.originalUrl);
+  if (fromOriginal) return fromOriginal;
+  const fromUrl = tokenFromUrlQueryString(req.url);
+  if (fromUrl) return fromUrl;
   return null;
 }
 

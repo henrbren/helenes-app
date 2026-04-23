@@ -507,7 +507,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [applyAuth]);
 
   const openStravaConnect = useCallback(async () => {
-    const url = absoluteUrlWithToken(serverUrl, '/strava/connect');
+    const tok = getSessionToken();
+    if (!tok) {
+      Alert.alert('Ikke innlogget', 'Start appen på nytt eller logg inn før du kobler til Strava.');
+      return;
+    }
+    try {
+      const me = await apiFetch('/auth/me', { ignoreAuthFailure: true });
+      if (!me.ok) {
+        Alert.alert(
+          'Sesjonen er utløpt',
+          'Logg ut og inn igjen (eller velg «Fortsett uten konto»), deretter prøv Strava på nytt. På Vercel må Redis (KV) være aktivert ellers utløper økter mellom forespørsler.',
+        );
+        return;
+      }
+    } catch {
+      Alert.alert('Ingen kontakt med server', 'Sjekk nettverk og server-adresse under Innstillinger, og prøv igjen.');
+      return;
+    }
+    const base = absoluteApiUrl(serverUrl, '/strava/connect');
+    const sep = base.includes('?') ? '&' : '?';
+    const url = `${base}${sep}token=${encodeURIComponent(tok)}`;
     try {
       if (Platform.OS === 'web' && typeof window !== 'undefined') {
         window.location.href = url;

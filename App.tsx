@@ -4034,7 +4034,7 @@ const ChatTab = React.forwardRef<
             </Pressable>
           </View>
           <ScrollView contentContainerStyle={styles.modalContent} keyboardShouldPersistTaps="handled">
-            <Text style={styles.fieldLabel}>Denne enheten</Text>
+            <Text style={styles.fieldLabel}>Konto</Text>
             <View style={{ gap: 4 }}>
               <Text style={styles.muted}>
                 {authUser?.hasPassword || authUser?.email
@@ -4055,7 +4055,7 @@ const ChatTab = React.forwardRef<
                 void Haptics.selectionAsync();
                 Alert.alert(
                   'Logge ut?',
-                  'Du må logge inn på nytt eller velge anonym økt for å bruke appen igjen.',
+                  'Sesjonen avsluttes på serveren. Du må logge inn på nytt, bruke Strava eller velge anonym økt for å fortsette.',
                   [
                     { text: 'Avbryt', style: 'cancel' },
                     {
@@ -4071,7 +4071,7 @@ const ChatTab = React.forwardRef<
               }}
               style={[styles.dangerButton, { marginTop: 12 }]}
             >
-              <Text style={styles.dangerButtonText}>Logg ut</Text>
+              <Text style={styles.dangerButtonText}>Logg ut av appen</Text>
             </Pressable>
 
             <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Strava</Text>
@@ -5031,9 +5031,15 @@ function AuthenticatedApp() {
     setRefreshing(false);
   }, [sessionsKey, runningProgramsKey]);
 
+  // Lukk innstillinger når brukeren bytter fane (unngå «hengende» modal).
   useEffect(() => {
-    if (activeTab !== 'Chat') setChatSettingsOpen(false);
+    setChatSettingsOpen(false);
   }, [activeTab]);
+
+  const openAppSettings = useCallback(() => {
+    void Haptics.selectionAsync();
+    setChatSettingsOpen(true);
+  }, []);
 
   const dailyQuote = useMemo(() => {
     const index = new Date().getDate() % motivationalQuotes.length;
@@ -5416,29 +5422,61 @@ function AuthenticatedApp() {
 
   const programHeader = (
     <View style={styles.programHeaderRow}>
-      <Text style={styles.h1}>Løpeprogram 🗓️</Text>
-      <Pressable
-        onPress={showRunningProgramHelp}
-        style={styles.programHelpIcon}
-        accessibilityRole="button"
-        accessibilityLabel="Hjelp: løpeprogram og Chat"
-        accessibilityHint="Forklarer hvordan du kan lage løpeprogram via Chat"
-        hitSlop={8}
-      >
-        <Text style={styles.programHelpIconText}>?</Text>
-      </Pressable>
+      <Text style={[styles.h1, { flex: 1, minWidth: 0 }]} numberOfLines={2}>
+        Løpeprogram 🗓️
+      </Text>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+        <Pressable
+          onPress={showRunningProgramHelp}
+          style={styles.programHelpIcon}
+          accessibilityRole="button"
+          accessibilityLabel="Hjelp: løpeprogram og Chat"
+          accessibilityHint="Forklarer hvordan du kan lage løpeprogram via Chat"
+          hitSlop={8}
+        >
+          <Text style={styles.programHelpIconText}>?</Text>
+        </Pressable>
+        <Pressable
+          onPress={openAppSettings}
+          accessibilityRole="button"
+          accessibilityLabel="Innstillinger"
+          style={({ pressed }) => [styles.chatGearButton, pressed && { opacity: 0.6, transform: [{ scale: 0.94 }] }]}
+        >
+          <Text style={styles.chatGearIcon}>⚙️</Text>
+        </Pressable>
+      </View>
     </View>
   );
 
   const sessionsHeader = (
-    <View style={{ gap: 10 }}>
-      <Text style={styles.h1}>Økter 💪</Text>
+    <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 10 }}>
+      <View style={{ flex: 1, gap: 10 }}>
+        <Text style={styles.h1}>Økter 💪</Text>
+      </View>
+      <Pressable
+        onPress={openAppSettings}
+        accessibilityRole="button"
+        accessibilityLabel="Innstillinger"
+        style={({ pressed }) => [styles.chatGearButton, pressed && { opacity: 0.6, transform: [{ scale: 0.94 }] }]}
+      >
+        <Text style={styles.chatGearIcon}>⚙️</Text>
+      </Pressable>
     </View>
   );
 
   const statsHeader = (
-    <View style={{ gap: 10 }}>
-      <Text style={styles.h1}>Statistikk 📊</Text>
+    <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 10 }}>
+      <View style={{ flex: 1, gap: 10 }}>
+        <Text style={styles.h1}>Statistikk 📊</Text>
+      </View>
+      <Pressable
+        onPress={openAppSettings}
+        accessibilityRole="button"
+        accessibilityLabel="Innstillinger"
+        style={({ pressed }) => [styles.chatGearButton, pressed && { opacity: 0.6, transform: [{ scale: 0.94 }] }]}
+      >
+        <Text style={styles.chatGearIcon}>⚙️</Text>
+      </Pressable>
     </View>
   );
 
@@ -5488,10 +5526,7 @@ function AuthenticatedApp() {
               <View style={styles.chatPageTopRow}>
                 <View style={{ flex: 1 }}>{header}</View>
                 <Pressable
-                  onPress={() => {
-                    void Haptics.selectionAsync();
-                    setChatSettingsOpen(true);
-                  }}
+                  onPress={openAppSettings}
                   accessibilityRole="button"
                   accessibilityLabel="Innstillinger"
                   style={({ pressed }) => [styles.chatGearButton, pressed && { opacity: 0.6, transform: [{ scale: 0.94 }] }]}
