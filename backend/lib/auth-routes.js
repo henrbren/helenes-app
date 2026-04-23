@@ -1,7 +1,5 @@
 import express from 'express';
 import { z } from 'zod';
-import { buildAuthorizeUrl } from '../strava.js';
-import { createOAuthState } from './oauth-state.js';
 import { clientIp, hitRateLimit } from './rate-limit.js';
 import {
   buildSessionCookie,
@@ -10,6 +8,7 @@ import {
   requireAuth,
 } from './sessions.js';
 import {
+  createAnonymousUser,
   createUserWithPassword,
   isAcceptablePassword,
   isValidEmail,
@@ -24,12 +23,34 @@ const RegisterSchema = z.object({
 const LoginSchema = RegisterSchema;
 
 /**
- * Bygger et Express-router-objekt med alle /auth-endepunkter. `stravaRedirectUri`
- * er en funksjon som gir riktig redirect URI avhengig av request (samme
- * logikk som for /strava/connect).
+ * Bygger et Express-router-objekt med alle /auth-endepunkter.
  */
-export function createAuthRouter({ stravaRedirectUri }) {
+export function createAuthRouter(_opts) {
   const router = express.Router();
+
+  /** Enkel enhetsøkt uten epost/passord (app uten innloggingsskjerm). */
+  router.post('/auth/anonymous', async (req, res) => {
+    const ip = clientIp(req);
+    const rl = await hitRateLimit({
+      prefix: 'auth:anonymous',
+      id: ip,
+      limit: 30,
+      windowSeconds: 15 * 60,
+    });
+    if (!rl.allowed) {
+      res.status(429).json({ error: 'For mange forsøk. Prøv igjen om noen minutter.' });
+      return;
+    }
+    try {
+      const user = await createAnonymousUser();
+      const { token } = await createSession(user.id);
+      res.setHeader('Set-Cookie', buildSessionCookie(token));
+      res.status(201).json({ sessionToken: token, user: publicUser(user) });
+    } catch (err) {
+      console.error('[/auth/anonymous] failed:', err?.message || err);
+      res.status(500).json({ error: 'Kunne ikke opprette økt.' });
+    }
+  });
 
   router.post('/auth/register', async (req, res) => {
     const ip = clientIp(req);
@@ -126,22 +147,6 @@ export function createAuthRouter({ stravaRedirectUri }) {
 
   router.get('/auth/me', requireAuth, (req, res) => {
     res.json({ user: req.publicUser });
-  });
-
-  /**
-   * Start "logg inn med Strava" – genererer et one-time state token uten
-   * eksisterende bruker, og redirecter til Strava. Callbacken vil opprette
-   * (eller gjenkjenne) en bruker ut fra athleteId.
-   */
-  router.get('/auth/strava/start', async (req, res) => {
-    try {
-      const redirectUri = stravaRedirectUri(req);
-      const state = await createOAuthState({ intent: 'login', redirectUri });
-      const url = buildAuthorizeUrl({ redirectUri, state });
-      res.redirect(url);
-    } catch (err) {
-      res.status(500).json({ error: err?.message || 'Kunne ikke starte Strava-innlogging.' });
-    }
   });
 
   return router;

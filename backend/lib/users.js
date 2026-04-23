@@ -109,6 +109,24 @@ export async function createUserWithPassword({ email, password }) {
   return user;
 }
 
+/**
+ * Opprett anonym enhetsbruker (ingen epost/passord). Brukes når appen kjører uten
+ * eksplisitt innlogging – samme lagringsmodell som øvrige brukere.
+ */
+export async function createAnonymousUser() {
+  const id = crypto.randomUUID();
+  const now = Date.now();
+  const user = {
+    id,
+    email: null,
+    passwordHash: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await kvSetJson(userKey(id), user);
+  return user;
+}
+
 /** Opprett bruker ut fra en Strava-autentisering (athlete + tokens). */
 export async function createUserFromStrava({ athleteId, athleteName }) {
   if (!athleteId) {

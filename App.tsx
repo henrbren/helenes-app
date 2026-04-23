@@ -41,15 +41,7 @@ import {
 import { GestureHandlerRootView, Swipeable } from 'react-native-gesture-handler';
 import PagerHost, { type PagerHostHandle } from './PagerHost';
 import Svg, { Line as SvgLine, Polygon as SvgPolygon, Polyline, Text as SvgText } from 'react-native-svg';
-import {
-  apiFetch,
-  AuthGate,
-  AuthProvider,
-  useAuth,
-  useUserId,
-  userKey,
-  type AuthUser,
-} from './auth';
+import { apiFetch, AuthGate, AuthProvider, useAuth, useUserId, userKey } from './auth';
 
 const STORAGE_KEY = 'training-log-ios:sessions:v1';
 const CHAT_STORAGE_KEY = 'training-log-ios:chat:v1';
@@ -3637,7 +3629,7 @@ const ChatTab = React.forwardRef<
 ) {
   const userId = useUserId();
   const auth = useAuth();
-  const { serverUrl, setServerUrl, resetToDefaultServerUrl, user: authUser, signOut } = auth;
+  const { serverUrl, setServerUrl, resetToDefaultServerUrl, user: authUser } = auth;
   const chatApiBase = serverUrl;
   const chatStorageKey = userKey(CHAT_STORAGE_KEY, userId);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -4042,12 +4034,11 @@ const ChatTab = React.forwardRef<
             </Pressable>
           </View>
           <ScrollView contentContainerStyle={styles.modalContent} keyboardShouldPersistTaps="handled">
-            <Text style={styles.fieldLabel}>Konto</Text>
+            <Text style={styles.fieldLabel}>Denne enheten</Text>
             <View style={{ gap: 4 }}>
-              <Text style={{ fontWeight: '700', color: '#0f172a' }}>
-                {authUser?.email || (authUser?.stravaAthleteName
-                  ? `${authUser.stravaAthleteName} (Strava)`
-                  : 'Innlogget bruker')}
+              <Text style={styles.muted}>
+                Appen bruker en anonym økt på denne enheten (ingen epost eller passord). Data knyttes
+                til denne økten på serveren.
               </Text>
               {authUser?.stravaAthleteId ? (
                 <Text style={styles.muted}>
@@ -4058,28 +4049,6 @@ const ChatTab = React.forwardRef<
                 <Text style={styles.muted}>Ingen Strava-konto koblet til ennå.</Text>
               )}
             </View>
-            <Pressable
-              onPress={() => {
-                void Haptics.selectionAsync();
-                Alert.alert('Logg ut?', 'Du kan logge inn igjen når som helst.', [
-                  { text: 'Avbryt', style: 'cancel' },
-                  {
-                    text: 'Logg ut',
-                    style: 'destructive',
-                    onPress: async () => {
-                      try {
-                        await signOut();
-                      } finally {
-                        onSettingsModalClose();
-                      }
-                    },
-                  },
-                ]);
-              }}
-              style={[styles.dangerButton, { marginTop: 8 }]}
-            >
-              <Text style={styles.dangerButtonText}>Logg ut</Text>
-            </Pressable>
 
             <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Strava</Text>
             <Text style={styles.muted}>
