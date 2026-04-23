@@ -539,6 +539,15 @@ function getTools() {
             title: { type: 'string', description: 'Kort navn, f.eks. "12 uker mot 10 km sub-50".' },
             goal_summary: { type: 'string', description: 'Brukerens mål i én–to setninger.' },
             weeks: { type: 'number', description: 'Antall uker programmet varer (1–52).' },
+            main_race_name: {
+              type: 'string',
+              description:
+                'Valgfritt: navn på hovedkonkurransen programmet bygger mot (f.eks. Oslo maraton). Bruk når brukeren har sagt hvilket løp det gjelder.',
+            },
+            main_race_date: {
+              type: 'string',
+              description: 'Valgfritt: konkurransedato på format YYYY-MM-DD (samme som i appen).',
+            },
             sessions: {
               type: 'array',
               description:
@@ -556,7 +565,7 @@ function getTools() {
                     type: 'string',
                     enum: ['Rolig løpetur', 'Terkeløkt', 'Intervaller', 'Konkurranse'],
                     description:
-                      'Økttype (samme som ved manuell løpelogging). Dette blir tittel på økten; bruk beskrivelsesfeltet for innhold.',
+                      'Økttype — bruk nøyaktig én av enum-verdiene (samme som manuell løpelogging). Det står «Terkeløkt» med e, ikke «Terskeløkt». Dette blir tittel på økten; detaljer kun i description.',
                   },
                   description: {
                     type: 'string',
@@ -573,6 +582,53 @@ function getTools() {
       },
     },
   ];
+}
+
+/** Må være identisk med enum i OpenAI-tool og App.tsx (unngå valideringsfeil når modellen varierer litt). */
+const RUN_WORKOUT_TYPES = ['Rolig løpetur', 'Terkeløkt', 'Intervaller', 'Konkurranse'];
+
+function normalizeRunWorkoutTypeString(raw) {
+  if (raw == null) return '';
+  const first = Array.isArray(raw) ? raw[0] : raw;
+  let s = String(first);
+  s = s.replace(/[\u200B-\u200D\uFEFF]/g, '');
+  s = s.replace(/\u00a0/g, ' ');
+  s = s.trim().replace(/\s+/g, ' ');
+  s = s.replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"');
+  return s;
+}
+
+/**
+ * Mapper nesten-riktige strenger fra LLM til eksakt enum.
+ * Mange modeller skriver «Terskeløkt»; i appen er det «Terkeløkt» (bevisst stavemåte i tool).
+ */
+function coerceRunWorkoutType(raw) {
+  const s = normalizeRunWorkoutTypeString(raw);
+  if (!s) return null;
+  const lower = s.toLowerCase();
+  for (const canon of RUN_WORKOUT_TYPES) {
+    if (canon.toLowerCase() === lower) return canon;
+  }
+  if (/terskel|terkel|threshold|tempoøkt|tempo(?!\s*intervall)/i.test(s)) return 'Terkeløkt';
+  if (/intervall|fartlek|sprint|drag/i.test(lower)) return 'Intervaller';
+  if (/konkurranse|ritt\b|testøkt|^race$/i.test(lower)) return 'Konkurranse';
+  if (/rolig|lett\s*løp|easy|langtur|nedjogg|recovery|hvile.*løp|jogg/i.test(lower)) return 'Rolig løpetur';
+  return null;
+}
+
+function normalizeCreateRunningProgramArgs(args) {
+  if (!args || typeof args !== 'object') return args;
+  const out = { ...args };
+  if (out.main_race_name != null && String(out.main_race_name).trim() === '') delete out.main_race_name;
+  if (out.main_race_date != null && String(out.main_race_date).trim() === '') delete out.main_race_date;
+  if (Array.isArray(out.sessions)) {
+    out.sessions = out.sessions.map((sess) => {
+      if (!sess || typeof sess !== 'object') return sess;
+      const fixed = coerceRunWorkoutType(sess.workout_type) || 'Rolig løpetur';
+      return { ...sess, workout_type: fixed };
+    });
+  }
+  return out;
 }
 
 async function runToolCall(name, args, ctx) {
@@ -641,11 +697,13 @@ async function runToolCall(name, args, ctx) {
   }
 
   if (name === 'create_running_program') {
-    const runWorkoutTypeEnum = z.enum(['Rolig løpetur', 'Terkeløkt', 'Intervaller', 'Konkurranse']);
+    const runWorkoutTypeEnum = z.enum(RUN_WORKOUT_TYPES);
     const schema = z.object({
       title: z.string().min(2).max(120),
       goal_summary: z.string().min(2).max(500),
       weeks: z.number().int().min(1).max(52),
+      main_race_name: z.string().min(1).max(120).optional(),
+      main_race_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
       sessions: z
         .array(
           z.object({
@@ -658,7 +716,7 @@ async function runToolCall(name, args, ctx) {
         .min(1)
         .max(250),
     });
-    const parsed = schema.parse(args ?? {});
+    const parsed = schema.parse(normalizeCreateRunningProgramArgs(args ?? {}));
     for (const s of parsed.sessions) {
       if (s.week > parsed.weeks) {
         return {
@@ -673,6 +731,10 @@ async function runToolCall(name, args, ctx) {
       title: parsed.title,
       goalSummary: parsed.goal_summary,
       weeks: parsed.weeks,
+      ...(parsed.main_race_name?.trim()
+        ? { competitionName: parsed.main_race_name.trim() }
+        : {}),
+      ...(parsed.main_race_date ? { competitionDate: parsed.main_race_date } : {}),
       sessions: parsed.sessions.map((s) => {
         const wt = s.workout_type;
         return {
@@ -961,6 +1023,56 @@ app.post('/chat/session-feedback', requireAuth, async (req, res) => {
     res.json({ text });
   } catch (err) {
     console.error('[/chat/session-feedback] error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Server error' });
+  }
+});
+
+// ---- Oppfølging dagen etter konkurranse (lagret i løpeprogram) --------------
+const CompetitionFollowupSchema = z.object({
+  competitionName: z.string().min(1).max(120),
+  competitionDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  programTitle: z.string().min(1).max(200),
+});
+
+app.post('/chat/competition-followup', requireAuth, async (req, res) => {
+  const parse = CompetitionFollowupSchema.safeParse(req.body);
+  if (!parse.success) {
+    console.error('[/chat/competition-followup] invalid payload', parse.error?.issues);
+    res.status(400).json({ error: 'Invalid payload', details: parse.error?.issues });
+    return;
+  }
+
+  const { competitionName, competitionDate, programTitle } = parse.data;
+
+  const systemPrompt = [
+    'Du er Helenes personlige løpe- og styrketrener i appen hennes.',
+    'I går (eller det brukeren opplever som konkurransedagen som nettopp var) hadde hun en planlagt konkurranse som er registrert i løpeprogrammet sitt.',
+    'Skriv en kort, varm melding på norsk (3–6 setninger) som i en chat: spør hvordan det gikk, vis at du bryr deg, og åpne for at hun kan dele tid, følelse eller det som var viktigst.',
+    'Ikke moraliser. Ikke anta resultat (verken PB eller skuffelse). Ikke bruk overskrifter, punktlister, emojis eller markdown.',
+    'Du-form til Helene. Vær konkret om hvilken konkurranse det gjelder (navn) og at dette er oppfølging dagen etter.',
+  ].join('\n');
+
+  const userPrompt = `Program i appen: «${programTitle}»\nKonkurranse: ${competitionName}\nDato (registrert): ${competitionDate}`;
+
+  try {
+    console.log(
+      `[/chat/competition-followup] user=${req.user.id} race=${competitionName} date=${competitionDate}`,
+    );
+    const completion = await getOpenAI().chat.completions.create({
+      model: OPENAI_MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+    });
+    const text = (completion.choices?.[0]?.message?.content || '').trim();
+    if (!text) {
+      res.status(500).json({ error: 'Tomt svar fra modellen' });
+      return;
+    }
+    res.json({ text });
+  } catch (err) {
+    console.error('[/chat/competition-followup] error:', err?.message || err);
     res.status(500).json({ error: err?.message || 'Server error' });
   }
 });

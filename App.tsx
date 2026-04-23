@@ -28,6 +28,7 @@ import {
   Platform,
   Modal,
   Pressable,
+  AppState,
   RefreshControl,
   SafeAreaView,
   ScrollView,
@@ -38,6 +39,7 @@ import {
   View,
   type ViewStyle,
 } from 'react-native';
+import FontAwesome6 from '@expo/vector-icons/FontAwesome6';
 import { GestureHandlerRootView, Swipeable } from 'react-native-gesture-handler';
 import PagerHost, { type PagerHostHandle } from './PagerHost';
 import Svg, { Line as SvgLine, Polygon as SvgPolygon, Polyline, Text as SvgText } from 'react-native-svg';
@@ -51,6 +53,7 @@ const STRAVA_STATS_CACHE_KEY = 'training-log-ios:strava-stats:v1';
 const STRAVA_BEST_EFFORTS_CACHE_KEY = 'training-log-ios:strava-best-efforts:v1';
 const STRAVA_CONNECTED_KEY = 'training-log-ios:strava-connected:v1';
 const RUNNING_PROGRAMS_KEY = 'training-log-ios:running-programs:v1';
+const COMPETITION_FOLLOWUP_KEY = 'training-log-ios:competition-followup-sent:v1';
 
 const tabs = ['Chat', 'Løpeprogram', 'Økter', 'Statistikk'] as const;
 type Tab = (typeof tabs)[number];
@@ -292,6 +295,10 @@ type RunningProgramPayload = {
   title: string;
   goalSummary: string;
   weeks: number;
+  /** Hovedkonkurranse programmet bygger mot (valgfritt, fra chat eller redigering). */
+  competitionName?: string;
+  /** ISO YYYY-MM-DD */
+  competitionDate?: string;
   sessions: Array<{
     week: number;
     dayLabel: string;
@@ -322,6 +329,10 @@ type SavedRunningProgram = {
   title: string;
   goalSummary: string;
   weeks: number;
+  /** Valgfritt: konkurranse programmet er rettet mot (vises for treneren i chat). */
+  competitionName?: string;
+  /** ISO YYYY-MM-DD */
+  competitionDate?: string;
   createdAt: number;
   /** Sist oppdatert (redigering, lagring, avkryssing av økter osv.). */
   updatedAt?: number;
@@ -722,6 +733,8 @@ function StravaCard({
   refreshSignal?: number;
   onNewActivity?: (activity: StravaActivity) => void;
 }) {
+  const { user } = useAuth();
+  const stravaAthleteId = user?.stravaAthleteId;
   const userId = useUserId();
   const stravaCacheKey = userKey(STRAVA_CACHE_KEY, userId);
   const stravaConnectedKey = userKey(STRAVA_CONNECTED_KEY, userId);
@@ -808,7 +821,7 @@ function StravaCard({
     );
   }, [stravaSeenIdsKey]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (opts?: { quiet?: boolean }) => {
     setIsLoading(true);
     setError(null);
     setNeedsAuth(false);
@@ -827,16 +840,25 @@ function StravaCard({
       await AsyncStorage.setItem(stravaCacheKey, JSON.stringify(fresh));
       setIsConnected(true);
       await AsyncStorage.setItem(stravaConnectedKey, '1');
-      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      if (!opts?.quiet) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      }
       // Detekter nye aktiviteter etter en vellykket sync.
       void reportNewActivities(fresh.activities || []);
     } catch (e: any) {
-      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      if (!opts?.quiet) {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      }
       setError(String(e?.message || e));
     } finally {
       setIsLoading(false);
     }
   }, [reportNewActivities, stravaCacheKey, stravaConnectedKey]);
+
+  useEffect(() => {
+    if (!stravaAthleteId) return;
+    void refresh({ quiet: true });
+  }, [stravaAthleteId, refresh]);
 
   useEffect(() => {
     if (refreshSignal <= 0) return;
@@ -1745,6 +1767,8 @@ function StravaStatsCard({
   onAllRunTotalsChange?: (totals: { distanceMeters: number | null; movingSeconds: number | null }) => void;
   refreshSignal?: number;
 }) {
+  const { user } = useAuth();
+  const stravaAthleteId = user?.stravaAthleteId;
   const userId = useUserId();
   const statsCacheKey = userKey(STRAVA_STATS_CACHE_KEY, userId);
   const [data, setData] = useState<StravaStats | null>(null);
@@ -1789,21 +1813,25 @@ function StravaStatsCard({
   }, [statsCacheKey]);
 
   useEffect(() => {
+    if (!stravaAthleteId) return;
     void refresh();
-  }, [refresh]);
+  }, [stravaAthleteId, refresh]);
 
   useEffect(() => {
     if (refreshSignal <= 0) return;
+    if (!stravaAthleteId) return;
     void refresh();
-  }, [refreshSignal, refresh]);
+  }, [refreshSignal, stravaAthleteId, refresh]);
 
   const s = data?.stats;
-  const updatedLabel = data?.fetchedAt
-    ? `Sist oppdatert ${new Date(data.fetchedAt).toLocaleTimeString('nb-NO', {
-        hour: '2-digit',
-        minute: '2-digit',
-      })}`
-    : 'Henter…';
+  const updatedLabel = !stravaAthleteId
+    ? 'Koble til Strava under Innstillinger for å hente statistikk.'
+    : data?.fetchedAt
+      ? `Sist oppdatert ${new Date(data.fetchedAt).toLocaleTimeString('nb-NO', {
+          hour: '2-digit',
+          minute: '2-digit',
+        })}`
+      : 'Henter…';
 
   const sections: { title: string; rows: { label: string; totals?: StravaTotals }[] }[] = s
     ? [
@@ -1974,9 +2002,13 @@ async function fetchWithTimeout(
 
 function StravaBestEffortsCard({
   defaultExpanded = false,
+  refreshSignal = 0,
 }: {
   defaultExpanded?: boolean;
+  refreshSignal?: number;
 } = {}) {
+  const { user } = useAuth();
+  const stravaAthleteId = user?.stravaAthleteId;
   const userId = useUserId();
   const bestEffortsCacheKey = userKey(STRAVA_BEST_EFFORTS_CACHE_KEY, userId);
   const [data, setData] = useState<StravaBestEfforts | null>(null);
@@ -1986,6 +2018,7 @@ function StravaBestEffortsCard({
 
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isMountedRef = useRef(true);
+  const refreshRef = useRef<(opts?: { quiet?: boolean }) => Promise<void>>(async () => {});
 
   const parseResponse = useCallback((body: any): StravaBestEfforts => {
     return {
@@ -2039,11 +2072,11 @@ function StravaBestEffortsCard({
   );
 
   const scheduleNextPoll = useCallback(
-    (delayMs: number, startedAt: number) => {
+    (delayMs: number, startedAt: number, quietHaptics: boolean) => {
       clearPoll();
       pollRef.current = setTimeout(async () => {
         if (!isMountedRef.current) return;
-        // Stop polling after 3 minutes regardless — the user can refresh manually.
+        // Stop polling after 3 minutes regardless — bruker kan fortsatt trykke ↻.
         if (Date.now() - startedAt > 3 * 60 * 1000) {
           setIsLoading(false);
           return;
@@ -2056,27 +2089,88 @@ function StravaBestEffortsCard({
           if (snapshot.lastError) {
             setError(snapshot.lastError);
             setIsLoading(false);
-            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+            if (!quietHaptics) {
+              void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+            }
             return;
           }
           if (snapshot.scanning) {
-            scheduleNextPoll(3000, startedAt);
+            scheduleNextPoll(3000, startedAt, quietHaptics);
           } else {
+            const pending = snapshot.pendingRuns ?? 0;
+            if (pending > 0 && !snapshot.rateLimited) {
+              clearPoll();
+              pollRef.current = setTimeout(() => {
+                void refreshRef.current({ quiet: true });
+              }, 1500);
+              return;
+            }
             setIsLoading(false);
+            if (!quietHaptics) {
+              void Haptics.notificationAsync(
+                snapshot.rateLimited
+                  ? Haptics.NotificationFeedbackType.Warning
+                  : Haptics.NotificationFeedbackType.Success,
+              );
+            }
+          }
+        } catch {
+          scheduleNextPoll(5000, startedAt, quietHaptics);
+        }
+      }, delayMs);
+    },
+    [clearPoll, fetchSnapshot, persistSnapshot],
+  );
+
+  const refresh = useCallback(
+    async (opts?: { quiet?: boolean }) => {
+      setIsLoading(true);
+      setError(null);
+      try {
+        const snapshot = await fetchSnapshot(true);
+        if (!isMountedRef.current) return;
+        setData(snapshot);
+        void persistSnapshot(snapshot);
+        if (snapshot.lastError) {
+          setError(snapshot.lastError);
+          setIsLoading(false);
+          if (!opts?.quiet) {
+            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+          }
+          return;
+        }
+        if (snapshot.scanning) {
+          scheduleNextPoll(3000, Date.now(), !!opts?.quiet);
+        } else {
+          const pending = snapshot.pendingRuns ?? 0;
+          if (pending > 0 && !snapshot.rateLimited) {
+            clearPoll();
+            pollRef.current = setTimeout(() => {
+              void refreshRef.current({ quiet: true });
+            }, 1500);
+            return;
+          }
+          setIsLoading(false);
+          if (!opts?.quiet) {
             void Haptics.notificationAsync(
               snapshot.rateLimited
                 ? Haptics.NotificationFeedbackType.Warning
                 : Haptics.NotificationFeedbackType.Success,
             );
           }
-        } catch (e: any) {
-          // Transient poll errors shouldn't stop the UI — just try again.
-          scheduleNextPoll(5000, startedAt);
         }
-      }, delayMs);
+      } catch (e: any) {
+        if (!opts?.quiet) {
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        }
+        setError(String(e?.message || e));
+        setIsLoading(false);
+      }
     },
-    [clearPoll, fetchSnapshot, persistSnapshot],
+    [fetchSnapshot, persistSnapshot, scheduleNextPoll, clearPoll],
   );
+
+  refreshRef.current = refresh;
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -2088,6 +2182,7 @@ function StravaBestEffortsCard({
       } catch {
         // ignore
       }
+      if (!stravaAthleteId || cancelled) return;
       try {
         const snapshot = await fetchSnapshot(false);
         if (cancelled) return;
@@ -2095,10 +2190,19 @@ function StravaBestEffortsCard({
         void persistSnapshot(snapshot);
         if (snapshot.scanning) {
           setIsLoading(true);
-          scheduleNextPoll(3000, Date.now());
+          scheduleNextPoll(3000, Date.now(), true);
+          return;
         }
-      } catch {
-        // silently ignore — user can trigger a manual refresh
+        const pending = snapshot.pendingRuns ?? 0;
+        const noScanYet =
+          snapshot.scannedRuns === 0 &&
+          (snapshot.efforts?.length ?? 0) === 0 &&
+          !snapshot.rateLimited;
+        if (pending > 0 || noScanYet) {
+          void refreshRef.current({ quiet: true });
+        }
+      } catch (e: any) {
+        if (!cancelled) setError(String(e?.message || e));
       }
     })();
     return () => {
@@ -2106,31 +2210,20 @@ function StravaBestEffortsCard({
       isMountedRef.current = false;
       clearPoll();
     };
-  }, [clearPoll, fetchSnapshot, persistSnapshot, scheduleNextPoll]);
+  }, [
+    bestEffortsCacheKey,
+    stravaAthleteId,
+    clearPoll,
+    fetchSnapshot,
+    persistSnapshot,
+    scheduleNextPoll,
+  ]);
 
-  const refresh = useCallback(async () => {
-    setIsLoading(true);
-    setError(null);
-    try {
-      const snapshot = await fetchSnapshot(true);
-      setData(snapshot);
-      void persistSnapshot(snapshot);
-      if (snapshot.scanning) {
-        scheduleNextPoll(3000, Date.now());
-      } else {
-        setIsLoading(false);
-        void Haptics.notificationAsync(
-          snapshot.rateLimited
-            ? Haptics.NotificationFeedbackType.Warning
-            : Haptics.NotificationFeedbackType.Success,
-        );
-      }
-    } catch (e: any) {
-      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      setError(String(e?.message || e));
-      setIsLoading(false);
-    }
-  }, [fetchSnapshot, persistSnapshot, scheduleNextPoll]);
+  useEffect(() => {
+    if (refreshSignal <= 0) return;
+    if (!stravaAthleteId) return;
+    void refreshRef.current({ quiet: true });
+  }, [refreshSignal, stravaAthleteId]);
 
   const updatedLabel = data?.lastScanAt || data?.fetchedAt
     ? `Sist oppdatert ${new Date((data.lastScanAt || data.fetchedAt) as number).toLocaleTimeString('nb-NO', {
@@ -2231,7 +2324,9 @@ function StravaBestEffortsCard({
 
         {!data && !isLoading && !error ? (
           <Text style={styles.muted}>
-            Trykk ↻ for å beregne dine beste tider gjennom tidene. Vi henter detaljerte data fra Strava i puljer på 25 økter av gangen — trykk på nytt til alt er skannet.
+            {stravaAthleteId
+              ? 'Med Strava koblet til beregnes beste tider automatisk i puljer på 25 løpeøkter. Du kan også trykke ↻ for å tvinge en ny runde.'
+              : 'Koble til Strava under Innstillinger for å beregne beste tider fra løpeøktene dine.'}
           </Text>
         ) : null}
 
@@ -2243,7 +2338,7 @@ function StravaBestEffortsCard({
 
         {data && !isLoading && !showRateLimitNotice && hasPending ? (
           <Text style={styles.muted}>
-            {pendingRuns} økter gjenstår. Trykk ↻ for å fortsette skanningen — beste tider oppdateres etter hvert.
+            {pendingRuns} økter gjenstår — neste pulj hentes automatisk (eller trykk ↻).
           </Text>
         ) : null}
 
@@ -2479,6 +2574,8 @@ type ProgramFormDraft = {
   programId: string | null;
   title: string;
   goalSummary: string;
+  competitionName: string;
+  competitionDate: string;
   weeksStr: string;
   sessionsPerWeekStr: string;
   lines: ProgramLineForm[];
@@ -2547,6 +2644,8 @@ function createEmptyCreateDraft(): ProgramFormDraft {
     programId: null,
     title: '',
     goalSummary: '',
+    competitionName: '',
+    competitionDate: '',
     weeksStr: String(DEFAULT_PROGRAM_WEEKS),
     sessionsPerWeekStr: String(DEFAULT_PROGRAM_SESSIONS_PER_WEEK),
     lines: buildProgramLines(DEFAULT_PROGRAM_WEEKS, DEFAULT_PROGRAM_SESSIONS_PER_WEEK, []),
@@ -2581,15 +2680,23 @@ function RunningProgramTab({
   onToggleItem,
   onDeleteProgram,
   onSaveProgram,
+  onMoveRunningProgramInTab,
 }: {
   programs: SavedRunningProgram[];
   onToggleItem: (programId: string, itemId: string) => void;
   onDeleteProgram: (programId: string) => void;
+  onMoveRunningProgramInTab: (
+    tab: 'active' | 'completed',
+    programId: string,
+    direction: 'up' | 'down',
+  ) => void;
   onSaveProgram: (payload: {
     mode: 'create' | 'edit';
     programId?: string;
     title: string;
     goalSummary: string;
+    competitionName?: string;
+    competitionDate?: string;
     weeks: number;
     items: Array<{
       id?: string;
@@ -2606,6 +2713,7 @@ function RunningProgramTab({
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const [expandedItemIds, setExpandedItemIds] = useState<Record<string, boolean>>({});
   const [programTab, setProgramTab] = useState<'active' | 'completed'>('active');
+  const [reorderEditMode, setReorderEditMode] = useState(false);
 
   function toggleItemExpanded(itemId: string) {
     setExpandedItemIds((prev) => ({ ...prev, [itemId]: !prev[itemId] }));
@@ -2613,6 +2721,7 @@ function RunningProgramTab({
   const [formOpen, setFormOpen] = useState(false);
   const [formDraft, setFormDraft] = useState<ProgramFormDraft>(() => createEmptyCreateDraft());
   const [datePickerLineKey, setDatePickerLineKey] = useState<string | null>(null);
+  const [competitionDatePickerOpen, setCompetitionDatePickerOpen] = useState(false);
   const [weekPickerLineKey, setWeekPickerLineKey] = useState<string | null>(null);
   const [showWeeksPicker, setShowWeeksPicker] = useState(false);
   const [showSessionsPerWeekPicker, setShowSessionsPerWeekPicker] = useState(false);
@@ -2665,9 +2774,25 @@ function RunningProgramTab({
     setExpandedIds((prev) => ({ ...prev, [programId]: !(prev[programId] ?? false) }));
   }
 
+  const visiblePrograms = useMemo(() => {
+    return programs.filter((p) => {
+      const isCompleted = p.items.length > 0 && p.items.every((it) => it.done);
+      return programTab === 'completed' ? isCompleted : !isCompleted;
+    });
+  }, [programs, programTab]);
+
+  useEffect(() => {
+    setReorderEditMode(false);
+  }, [programTab]);
+
+  useEffect(() => {
+    if (visiblePrograms.length < 2) setReorderEditMode(false);
+  }, [visiblePrograms.length]);
+
   function openCreateModal() {
     void Haptics.selectionAsync();
     setDatePickerLineKey(null);
+    setCompetitionDatePickerOpen(false);
     setFormDraft(createEmptyCreateDraft());
     setFormOpen(true);
   }
@@ -2680,6 +2805,8 @@ function RunningProgramTab({
       programId: p.id,
       title: p.title,
       goalSummary: p.goalSummary,
+      competitionName: p.competitionName || '',
+      competitionDate: p.competitionDate || '',
       weeksStr: String(p.weeks),
       sessionsPerWeekStr: String(deriveSessionsPerWeek(p.items)),
       lines: p.items.map((it) => ({
@@ -2738,6 +2865,7 @@ function RunningProgramTab({
   function closeFormModal() {
     setFormOpen(false);
     setDatePickerLineKey(null);
+    setCompetitionDatePickerOpen(false);
     setWeekPickerLineKey(null);
     setShowWeeksPicker(false);
     setShowSessionsPerWeekPicker(false);
@@ -2782,11 +2910,19 @@ function RunningProgramTab({
       return;
     }
     const w = Math.max(1, Math.min(52, parseInt(formDraft.weeksStr.replace(/\D/g, ''), 10) || 1));
+    const competitionName = formDraft.competitionName.trim();
+    const competitionDateRaw = formDraft.competitionDate.trim();
+    const competitionDate =
+      competitionDateRaw && /^\d{4}-\d{2}-\d{2}$/.test(competitionDateRaw)
+        ? competitionDateRaw
+        : undefined;
     if (formDraft.mode === 'create') {
       onSaveProgram({
         mode: 'create',
         title,
         goalSummary: formDraft.goalSummary.trim(),
+        competitionName: competitionName || undefined,
+        competitionDate,
         weeks: w,
         items: parsedLines.map((l) => ({ ...l, done: false })),
       });
@@ -2796,6 +2932,8 @@ function RunningProgramTab({
         programId: formDraft.programId,
         title,
         goalSummary: formDraft.goalSummary.trim(),
+        competitionName: competitionName || undefined,
+        competitionDate,
         weeks: w,
         items: parsedLines,
       });
@@ -2824,32 +2962,68 @@ function RunningProgramTab({
           ).length;
           const completedCount = programs.length - activeCount;
           return (
-            <View style={styles.programSubTabBar}>
-              {(
-                [
-                  { id: 'active' as const, label: 'Aktive', count: activeCount },
-                  { id: 'completed' as const, label: 'Fullførte', count: completedCount },
-                ]
-              ).map((tab) => {
-                const active = programTab === tab.id;
-                return (
-                  <Pressable
-                    key={tab.id}
-                    onPress={() => setProgramTab(tab.id)}
-                    style={[styles.programSubTab, active && styles.programSubTabActive]}
-                    accessibilityRole="button"
-                    accessibilityState={{ selected: active }}
-                    accessibilityLabel={`${tab.label} løpeprogrammer`}
-                  >
-                    <Text
-                      style={[styles.programSubTabText, active && styles.programSubTabTextActive]}
+            <>
+              <View style={styles.programSubTabBar}>
+                {(
+                  [
+                    { id: 'active' as const, label: 'Aktive', count: activeCount },
+                    { id: 'completed' as const, label: 'Fullførte', count: completedCount },
+                  ]
+                ).map((tab) => {
+                  const active = programTab === tab.id;
+                  return (
+                    <Pressable
+                      key={tab.id}
+                      onPress={() => {
+                        void Haptics.selectionAsync();
+                        setProgramTab(tab.id);
+                      }}
+                      style={[styles.programSubTab, active && styles.programSubTabActive]}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: active }}
+                      accessibilityLabel={`${tab.label} løpeprogrammer`}
                     >
-                      {tab.label} ({tab.count})
-                    </Text>
+                      <Text
+                        style={[styles.programSubTabText, active && styles.programSubTabTextActive]}
+                      >
+                        {tab.label} ({tab.count})
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+                {visiblePrograms.length > 1 ? (
+                  <Pressable
+                    onPress={() => {
+                      void Haptics.selectionAsync();
+                      setReorderEditMode((v) => !v);
+                    }}
+                    style={({ pressed }) => [
+                      styles.programReorderModeIconButton,
+                      reorderEditMode && styles.programReorderModeIconButtonOn,
+                      pressed && { opacity: 0.82 },
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel={
+                      reorderEditMode
+                        ? 'Avslutt redigering av rekkefølge'
+                        : 'Endre rekkefølge på løpeprogrammer'
+                    }
+                  >
+                    <FontAwesome6
+                      name="up-down"
+                      solid
+                      size={15}
+                      color={reorderEditMode ? '#C45872' : '#7A3C4A'}
+                    />
                   </Pressable>
-                );
-              })}
-            </View>
+                ) : null}
+              </View>
+              {reorderEditMode && visiblePrograms.length > 1 ? (
+                <Text style={styles.programReorderHint}>
+                  Bruk ↑ og ↓ til venstre på hvert kort for å flytte programmet.
+                </Text>
+              ) : null}
+            </>
           );
         })() : null}
 
@@ -2862,180 +3036,251 @@ function RunningProgramTab({
           </View>
         ) : null}
 
-        {(() => {
-          const visiblePrograms = programs.filter((p) => {
-            const isCompleted = p.items.length > 0 && p.items.every((it) => it.done);
-            return programTab === 'completed' ? isCompleted : !isCompleted;
-          });
-          if (programs.length > 0 && visiblePrograms.length === 0) {
-            return (
-              <View style={styles.programTabEmptyCard}>
-                <Text style={styles.programTabBodyText}>
-                  {programTab === 'completed'
-                    ? 'Ingen fullførte løpeprogrammer ennå. Kryss av alle øktene i et program for å fullføre det.'
-                    : 'Ingen aktive løpeprogrammer akkurat nå. Opprett et nytt program over.'}
-                </Text>
-              </View>
-            );
-          }
-          return null;
-        })()}
+        {programs.length > 0 && visiblePrograms.length === 0 ? (
+          <View style={styles.programTabEmptyCard}>
+            <Text style={styles.programTabBodyText}>
+              {programTab === 'completed'
+                ? 'Ingen fullførte løpeprogrammer ennå. Kryss av alle øktene i et program for å fullføre det.'
+                : 'Ingen aktive løpeprogrammer akkurat nå. Opprett et nytt program over.'}
+            </Text>
+          </View>
+        ) : null}
 
-        {programs.filter((p) => {
-          const isCompleted = p.items.length > 0 && p.items.every((it) => it.done);
-          return programTab === 'completed' ? isCompleted : !isCompleted;
-        }).map((p) => {
-          const doneCount = p.items.filter((i) => i.done).length;
-          const total = p.items.length;
-          const expanded = expandedIds[p.id] ?? false;
-          const sorted = sortRunningProgramItems(p.items);
-          return (
-            <SwipeToDelete
-              key={p.id}
-              onDelete={() => onDeleteProgram(p.id)}
-              confirmTitle="Slette program?"
-              confirmMessage={`"${p.title}" og alle avkrysninger fjernes.`}
-            >
-            <View style={styles.programCard}>
-              <View style={expanded ? styles.programCardHeaderExpanded : undefined}>
-              <View style={styles.programCardHeader}>
-                <Pressable
-                  onPress={() => toggleExpanded(p.id)}
-                  style={styles.programHeaderTap}
-                  accessibilityRole="button"
-                  accessibilityLabel={expanded ? `Skjul økter for ${p.title}` : `Vis økter for ${p.title}`}
-                >
-                  <View style={{ flex: 1, gap: 4 }}>
-                    <View style={styles.programTitleRow}>
-                      <Text style={styles.programCardTitle} numberOfLines={expanded ? undefined : 2}>
-                        {p.title}
-                      </Text>
-                    </View>
-                    <Text style={styles.programTabMuted} numberOfLines={expanded ? undefined : 2}>
-                      {p.goalSummary}
-                    </Text>
-                  </View>
-                </Pressable>
-                <View style={styles.programHeaderActions}>
-                  <Pressable
-                    onPress={() => {
-                      void Haptics.selectionAsync();
-                      openEditModal(p);
-                    }}
-                    style={({ pressed }) => [styles.sessionEditIconBtn, pressed && { opacity: 0.5 }]}
-                    accessibilityRole="button"
-                    accessibilityLabel={`Rediger ${p.title}`}
-                    hitSlop={8}
+        {visiblePrograms.length > 0
+          ? visiblePrograms.map((p, index) => {
+              const doneCount = p.items.filter((i) => i.done).length;
+              const total = p.items.length;
+              const expanded = expandedIds[p.id] ?? false;
+              const sorted = sortRunningProgramItems(p.items);
+              const canMoveUp = visiblePrograms.length > 1 && index > 0;
+              const canMoveDown = visiblePrograms.length > 1 && index < visiblePrograms.length - 1;
+              return (
+                <View key={p.id} style={{ marginTop: index === 0 ? 4 : 0, marginBottom: 14 }}>
+                  <SwipeToDelete
+                    onDelete={() => onDeleteProgram(p.id)}
+                    confirmTitle="Slette program?"
+                    confirmMessage={`"${p.title}" og alle avkrysninger fjernes.`}
                   >
-                    <Text style={styles.sessionEditIconText}>✎</Text>
-                  </Pressable>
-                  <Pressable
-                    onPress={() => {
-                      void Haptics.selectionAsync();
-                      toggleExpanded(p.id);
-                    }}
-                    style={({ pressed }) => [styles.cardIconButton, pressed && { opacity: 0.6 }]}
-                    accessibilityRole="button"
-                    accessibilityLabel={expanded ? `Skjul økter for ${p.title}` : `Vis økter for ${p.title}`}
-                    hitSlop={8}
-                  >
-                    <Text style={styles.cardIconButtonText}>{expanded ? '▴' : '▾'}</Text>
-                  </Pressable>
-                </View>
-              </View>
-              <Pressable
-                onPress={() => toggleExpanded(p.id)}
-                style={styles.programMetaRow}
-                accessibilityRole="button"
-                accessibilityLabel={expanded ? `Skjul økter for ${p.title}` : `Vis økter for ${p.title}`}
-              >
-                <Text style={[styles.programMeta, { flex: 1 }]}>
-                  {p.weeks} uker · {doneCount}/{total} økter fullført
-                </Text>
-                <Text style={styles.programUpdatedAt} numberOfLines={1}>
-                  {`Sist oppdatert ${formatProgramUpdatedAt(p.updatedAt ?? p.createdAt)}`}
-                </Text>
-              </Pressable>
-              </View>
-              {expanded ? (
-                <View style={styles.programChecklist}>
-                  {sorted.map((item) => {
-                    const itemOpen = !!expandedItemIds[item.id];
-                    const hasDescription = !!item.description?.trim();
-                    return (
-                      <View
-                        key={item.id}
-                        style={[styles.programCheckRow, item.done && styles.programCheckRowDone]}
-                      >
-                        <Pressable
-                          onPress={() => onToggleItem(p.id, item.id)}
-                          style={({ pressed }) => [
-                            styles.programCheckBoxBtn,
-                            pressed && { opacity: 0.6 },
-                          ]}
-                          hitSlop={8}
-                          accessibilityRole="checkbox"
-                          accessibilityState={{ checked: item.done }}
-                          accessibilityLabel={
-                            item.done
-                              ? 'Marker økten som ikke fullført'
-                              : 'Marker økten som fullført'
-                          }
-                        >
-                          <Text style={styles.programCheckMark}>{item.done ? '☑' : '☐'}</Text>
-                        </Pressable>
-                        <Pressable
-                          onPress={() => toggleItemExpanded(item.id)}
-                          style={{ flex: 1, gap: 2 }}
-                          accessibilityRole="button"
-                          accessibilityLabel={
-                            itemOpen ? 'Skjul detaljer for økten' : 'Vis detaljer for økten'
-                          }
-                        >
-                          <Text style={[styles.programItemDate, item.done && styles.programCheckDescDone]}>
-                            {[
-                              `Uke ${item.week}`,
-                              item.date ? formatNorwegianDate(item.date) : null,
-                              item.workoutType
-                                ? `${runWorkoutTypeOptions.find((o) => o.value === item.workoutType)?.emoji ?? '🏃'} ${runWorkoutTypeLabel(item.workoutType)}`
-                                : null,
-                            ]
-                              .filter(Boolean)
-                              .join(' – ')}
-                          </Text>
-                          {!(item.workoutType && item.title.trim() === item.workoutType.trim()) ? (
-                            <Text style={[styles.programCheckTitle, item.done && styles.programCheckTitleDone]}>
-                              {item.title}
-                            </Text>
+                    <View style={styles.programCard}>
+                      <View style={expanded ? styles.programCardHeaderExpanded : undefined}>
+                        <View style={styles.programCardHeader}>
+                          {reorderEditMode && visiblePrograms.length > 1 ? (
+                            <View style={styles.programReorderStepper}>
+                              <Pressable
+                                onPress={() => {
+                                  if (!canMoveUp) return;
+                                  void Haptics.selectionAsync();
+                                  onMoveRunningProgramInTab(programTab, p.id, 'up');
+                                }}
+                                disabled={!canMoveUp}
+                                style={({ pressed }) => [
+                                  styles.programReorderStepperBtn,
+                                  pressed && canMoveUp && { opacity: 0.6 },
+                                ]}
+                                accessibilityRole="button"
+                                accessibilityLabel={`Flytt ${p.title} opp`}
+                                hitSlop={6}
+                              >
+                                <Text
+                                  style={[
+                                    styles.programReorderStepperText,
+                                    !canMoveUp && styles.programReorderStepperTextDisabled,
+                                  ]}
+                                >
+                                  ↑
+                                </Text>
+                              </Pressable>
+                              <Pressable
+                                onPress={() => {
+                                  if (!canMoveDown) return;
+                                  void Haptics.selectionAsync();
+                                  onMoveRunningProgramInTab(programTab, p.id, 'down');
+                                }}
+                                disabled={!canMoveDown}
+                                style={({ pressed }) => [
+                                  styles.programReorderStepperBtn,
+                                  pressed && canMoveDown && { opacity: 0.6 },
+                                ]}
+                                accessibilityRole="button"
+                                accessibilityLabel={`Flytt ${p.title} ned`}
+                                hitSlop={6}
+                              >
+                                <Text
+                                  style={[
+                                    styles.programReorderStepperText,
+                                    !canMoveDown && styles.programReorderStepperTextDisabled,
+                                  ]}
+                                >
+                                  ↓
+                                </Text>
+                              </Pressable>
+                            </View>
                           ) : null}
-                          {itemOpen && hasDescription ? (
-                            <Text style={[styles.programCheckDesc, item.done && styles.programCheckDescDone]}>
-                              {item.description}
-                            </Text>
-                          ) : null}
-                        </Pressable>
-                        {hasDescription ? (
                           <Pressable
-                            onPress={() => toggleItemExpanded(item.id)}
-                            style={styles.programItemChevronBtn}
-                            hitSlop={8}
+                            onPress={() => toggleExpanded(p.id)}
+                            style={styles.programHeaderTap}
                             accessibilityRole="button"
                             accessibilityLabel={
-                              itemOpen ? 'Skjul detaljer for økten' : 'Vis detaljer for økten'
+                              expanded ? `Skjul økter for ${p.title}` : `Vis økter for ${p.title}`
                             }
                           >
-                            <Text style={styles.programItemChevron}>{itemOpen ? '▾' : '▸'}</Text>
+                            <View style={{ flex: 1, gap: 4 }}>
+                              <View style={styles.programTitleRow}>
+                                <Text
+                                  style={styles.programCardTitle}
+                                  numberOfLines={expanded ? undefined : 2}
+                                >
+                                  {p.title}
+                                </Text>
+                              </View>
+                              <Text
+                                style={styles.programTabMuted}
+                                numberOfLines={expanded ? undefined : 2}
+                              >
+                                {p.goalSummary}
+                              </Text>
+                              {p.competitionName || p.competitionDate ? (
+                                <Text style={styles.programCompetitionLine} numberOfLines={expanded ? undefined : 2}>
+                                  🏁{' '}
+                                  {[p.competitionName, p.competitionDate ? formatNorwegianDate(p.competitionDate) : null]
+                                    .filter(Boolean)
+                                    .join(' · ')}
+                                </Text>
+                              ) : null}
+                            </View>
                           </Pressable>
-                        ) : null}
+                          <View style={styles.programHeaderActions}>
+                            <Pressable
+                              onPress={() => {
+                                void Haptics.selectionAsync();
+                                openEditModal(p);
+                              }}
+                              style={({ pressed }) => [styles.sessionEditIconBtn, pressed && { opacity: 0.5 }]}
+                              accessibilityRole="button"
+                              accessibilityLabel={`Rediger ${p.title}`}
+                              hitSlop={8}
+                            >
+                              <Text style={styles.sessionEditIconText}>✎</Text>
+                            </Pressable>
+                            <Pressable
+                              onPress={() => {
+                                void Haptics.selectionAsync();
+                                toggleExpanded(p.id);
+                              }}
+                              style={({ pressed }) => [styles.cardIconButton, pressed && { opacity: 0.6 }]}
+                              accessibilityRole="button"
+                              accessibilityLabel={
+                                expanded ? `Skjul økter for ${p.title}` : `Vis økter for ${p.title}`
+                              }
+                              hitSlop={8}
+                            >
+                              <Text style={styles.cardIconButtonText}>{expanded ? '▴' : '▾'}</Text>
+                            </Pressable>
+                          </View>
+                        </View>
+                        <Pressable
+                          onPress={() => toggleExpanded(p.id)}
+                          style={styles.programMetaRow}
+                          accessibilityRole="button"
+                          accessibilityLabel={
+                            expanded ? `Skjul økter for ${p.title}` : `Vis økter for ${p.title}`
+                          }
+                        >
+                          <Text style={[styles.programMeta, { flex: 1 }]}>
+                            {p.weeks} uker · {doneCount}/{total} økter fullført
+                          </Text>
+                          <Text style={styles.programUpdatedAt} numberOfLines={1}>
+                            {`Sist oppdatert ${formatProgramUpdatedAt(p.updatedAt ?? p.createdAt)}`}
+                          </Text>
+                        </Pressable>
                       </View>
-                    );
-                  })}
+                      {expanded ? (
+                        <View style={styles.programChecklist}>
+                          {sorted.map((item) => {
+                            const itemOpen = !!expandedItemIds[item.id];
+                            const hasDescription = !!item.description?.trim();
+                            return (
+                              <View
+                                key={item.id}
+                                style={[styles.programCheckRow, item.done && styles.programCheckRowDone]}
+                              >
+                                <Pressable
+                                  onPress={() => onToggleItem(p.id, item.id)}
+                                  style={({ pressed }) => [
+                                    styles.programCheckBoxBtn,
+                                    pressed && { opacity: 0.6 },
+                                  ]}
+                                  hitSlop={8}
+                                  accessibilityRole="checkbox"
+                                  accessibilityState={{ checked: item.done }}
+                                  accessibilityLabel={
+                                    item.done
+                                      ? 'Marker økten som ikke fullført'
+                                      : 'Marker økten som fullført'
+                                  }
+                                >
+                                  <Text style={styles.programCheckMark}>{item.done ? '☑' : '☐'}</Text>
+                                </Pressable>
+                                <Pressable
+                                  onPress={() => toggleItemExpanded(item.id)}
+                                  style={{ flex: 1, gap: 2 }}
+                                  accessibilityRole="button"
+                                  accessibilityLabel={
+                                    itemOpen ? 'Skjul detaljer for økten' : 'Vis detaljer for økten'
+                                  }
+                                >
+                                  <Text
+                                    style={[styles.programItemDate, item.done && styles.programCheckDescDone]}
+                                  >
+                                    {[
+                                      `Uke ${item.week}`,
+                                      item.date ? formatNorwegianDate(item.date) : null,
+                                      item.workoutType
+                                        ? `${runWorkoutTypeOptions.find((o) => o.value === item.workoutType)?.emoji ?? '🏃'} ${runWorkoutTypeLabel(item.workoutType)}`
+                                        : null,
+                                    ]
+                                      .filter(Boolean)
+                                      .join(' – ')}
+                                  </Text>
+                                  {!(item.workoutType && item.title.trim() === item.workoutType.trim()) ? (
+                                    <Text
+                                      style={[styles.programCheckTitle, item.done && styles.programCheckTitleDone]}
+                                    >
+                                      {item.title}
+                                    </Text>
+                                  ) : null}
+                                  {itemOpen && hasDescription ? (
+                                    <Text
+                                      style={[styles.programCheckDesc, item.done && styles.programCheckDescDone]}
+                                    >
+                                      {item.description}
+                                    </Text>
+                                  ) : null}
+                                </Pressable>
+                                {hasDescription ? (
+                                  <Pressable
+                                    onPress={() => toggleItemExpanded(item.id)}
+                                    style={styles.programItemChevronBtn}
+                                    hitSlop={8}
+                                    accessibilityRole="button"
+                                    accessibilityLabel={
+                                      itemOpen ? 'Skjul detaljer for økten' : 'Vis detaljer for økten'
+                                    }
+                                  >
+                                    <Text style={styles.programItemChevron}>{itemOpen ? '▾' : '▸'}</Text>
+                                  </Pressable>
+                                ) : null}
+                              </View>
+                            );
+                          })}
+                        </View>
+                      ) : null}
+                    </View>
+                  </SwipeToDelete>
                 </View>
-              ) : null}
-            </View>
-            </SwipeToDelete>
-          );
-        })}
+              );
+            })
+          : null}
       </View>
 
       <Modal visible={formOpen} animationType="slide" onRequestClose={closeFormModal}>
@@ -3081,6 +3326,50 @@ function RunningProgramTab({
                 style={[styles.input, styles.textarea]}
                 multiline
               />
+
+              <Text style={styles.fieldLabel}>Konkurranse (valgfritt)</Text>
+              <TextInput
+                value={formDraft.competitionName}
+                onChangeText={(t) => setFormDraft((d) => ({ ...d, competitionName: t }))}
+                placeholder="F.eks. Oslo halvmaraton"
+                style={styles.input}
+              />
+              <View style={styles.field}>
+                <Text style={styles.fieldLabel}>Konkurranse-dato</Text>
+                <Pressable
+                  onPress={() => {
+                    void Haptics.selectionAsync();
+                    setDatePickerLineKey(null);
+                    setCompetitionDatePickerOpen(true);
+                  }}
+                  style={styles.dropdownButton}
+                  accessibilityRole="button"
+                  accessibilityLabel="Velg konkurranse-dato"
+                >
+                  <Text
+                    style={[
+                      styles.dropdownButtonText,
+                      !formDraft.competitionDate && styles.dropdownButtonPlaceholder,
+                    ]}
+                  >
+                    {displayDate(formDraft.competitionDate)}
+                  </Text>
+                  <Text style={styles.dropdownChevron}>📅</Text>
+                </Pressable>
+                {formDraft.competitionDate ? (
+                  <Pressable
+                    onPress={() => {
+                      void Haptics.selectionAsync();
+                      setFormDraft((d) => ({ ...d, competitionDate: '' }));
+                    }}
+                    style={{ marginTop: 8 }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Fjern konkurranse-dato"
+                  >
+                    <Text style={styles.muted}>Fjern dato</Text>
+                  </Pressable>
+                ) : null}
+              </View>
 
               <View style={{ flexDirection: 'row', gap: 12 }}>
                 <View style={{ flex: 1 }}>
@@ -3236,6 +3525,7 @@ function RunningProgramTab({
                           <Pressable
                             onPress={() => {
                               void Haptics.selectionAsync();
+                              setCompetitionDatePickerOpen(false);
                               setDatePickerLineKey(line.key);
                             }}
                             style={styles.dropdownButton}
@@ -3437,6 +3727,50 @@ function RunningProgramTab({
             </Pressable>
           </Modal>
 
+          {competitionDatePickerOpen && Platform.OS === 'android' ? (
+            <DateTimePicker
+              value={parseDateStr(formDraft.competitionDate || '')}
+              mode="date"
+              display="default"
+              onChange={(event, selected) => {
+                setCompetitionDatePickerOpen(false);
+                if (event?.type === 'set' && selected) {
+                  setFormDraft((d) => ({ ...d, competitionDate: toDateStr(selected) }));
+                }
+              }}
+            />
+          ) : null}
+
+          <Modal
+            visible={competitionDatePickerOpen && Platform.OS !== 'android'}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setCompetitionDatePickerOpen(false)}
+          >
+            <Pressable style={styles.dropdownBackdrop} onPress={() => setCompetitionDatePickerOpen(false)}>
+              <Pressable style={styles.dropdownSheet} onPress={(e) => e.stopPropagation()}>
+                <Text style={styles.dropdownSheetTitle}>Konkurranse-dato</Text>
+                <DateTimePicker
+                  value={parseDateStr(formDraft.competitionDate || '')}
+                  mode="date"
+                  display="inline"
+                  locale="nb-NO"
+                  onChange={(_event, selected) => {
+                    if (selected) {
+                      setFormDraft((d) => ({ ...d, competitionDate: toDateStr(selected) }));
+                    }
+                  }}
+                />
+                <Pressable
+                  onPress={() => setCompetitionDatePickerOpen(false)}
+                  style={[styles.pinkButtonFull, { marginTop: 8 }]}
+                >
+                  <Text style={styles.pinkButtonText}>Ferdig</Text>
+                </Pressable>
+              </Pressable>
+            </Pressable>
+          </Modal>
+
           <Modal
             visible={weekPickerLineKey != null}
             transparent
@@ -3609,30 +3943,24 @@ type ChatTabHandle = {
     historyDescription: string;
     source: 'manual' | 'strava';
   }) => Promise<boolean>;
+  /** Dagen etter registrert konkurranse: én oppfølgingsmelding per program/dato (idempotent). */
+  maybeSendCompetitionFollowups: (programs: SavedRunningProgram[]) => Promise<void>;
+  /** Synkroniser chat-state etter at historikk er tømt fra lagring (innstillinger). */
+  resetChatToWelcome: () => void;
 };
 
 const ChatTab = React.forwardRef<
   ChatTabHandle,
   {
-    settingsModalOpen: boolean;
-    onSettingsModalClose: () => void;
     onSaveRunningProgram: (payload: RunningProgramPayload) => void;
     onAfterProgramSaved?: () => void;
+    onCompetitionFollowupPosted?: () => void;
+    runningPrograms: SavedRunningProgram[];
   }
->(function ChatTab(
-  {
-    settingsModalOpen,
-    onSettingsModalClose,
-    onSaveRunningProgram,
-    onAfterProgramSaved,
-  },
-  ref,
-) {
+>(function ChatTab({ onSaveRunningProgram, onAfterProgramSaved, onCompetitionFollowupPosted, runningPrograms }, ref) {
   const userId = useUserId();
-  const auth = useAuth();
-  const { serverUrl, setServerUrl, resetToDefaultServerUrl, user: authUser, signOut } = auth;
-  const chatApiBase = serverUrl;
   const chatStorageKey = userKey(CHAT_STORAGE_KEY, userId);
+  const competitionFollowupKey = userKey(COMPETITION_FOLLOWUP_KEY, userId);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -3709,6 +4037,17 @@ const ChatTab = React.forwardRef<
   React.useImperativeHandle(
     ref,
     () => ({
+      resetChatToWelcome() {
+        setMessages([
+          {
+            id: `${Date.now()}-welcome`,
+            role: 'assistant',
+            text:
+              'Hei! Jeg er din personlige trener. Jeg kan svare på spørsmål om løping og trening, lage løpeprogrammer du kan lagre som sjekkliste under fanen Løpeprogram, og hente oversikt fra Strava når det er koblet til. Hva lurer du på i dag?',
+            createdAt: Date.now(),
+          },
+        ]);
+      },
       async requestSessionFeedback({ sessionDescription, historyDescription, source }) {
         if (!sessionDescription?.trim()) return false;
         setIsSending(true);
@@ -3749,8 +4088,68 @@ const ChatTab = React.forwardRef<
           setIsSending(false);
         }
       },
+      async maybeSendCompetitionFollowups(programs: SavedRunningProgram[]) {
+        const y = yesterdayYyyyMmDd();
+        const candidates = programs.filter(
+          (p) => p.competitionName?.trim() && p.competitionDate?.trim() === y,
+        );
+        if (candidates.length === 0) return;
+
+        let sent: Record<string, true> = {};
+        try {
+          const raw = await AsyncStorage.getItem(competitionFollowupKey);
+          if (raw) {
+            const parsed = JSON.parse(raw) as unknown;
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              sent = parsed as Record<string, true>;
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+
+        for (const p of candidates) {
+          const markKey = `${p.id}:${p.competitionDate}`;
+          if (sent[markKey]) continue;
+
+          try {
+            const resp = await apiFetch('/chat/competition-followup', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                competitionName: p.competitionName!.trim(),
+                competitionDate: p.competitionDate!,
+                programTitle: p.title,
+              }),
+              timeoutMs: 45000,
+            });
+            const rawBody = await parseFetchJsonBody(resp);
+            if (!resp.ok) {
+              const body = rawBody as { error?: string };
+              throw new Error(body?.error || `Server feilet (${resp.status}).`);
+            }
+            const data = rawBody as { text?: string };
+            const text = (data?.text || '').trim();
+            if (!text) continue;
+
+            const assistantMsg: ChatMessage = {
+              id: `${Date.now()}-comp-${p.id}`,
+              role: 'assistant',
+              text,
+              createdAt: Date.now(),
+            };
+            setMessages((prev) => [assistantMsg, ...prev]);
+            sent = { ...sent, [markKey]: true };
+            await AsyncStorage.setItem(competitionFollowupKey, JSON.stringify(sent));
+            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+            onCompetitionFollowupPosted?.();
+          } catch (e: any) {
+            console.warn('[competition followup] failed:', e?.message || e);
+          }
+        }
+      },
     }),
-    [],
+    [competitionFollowupKey, onCompetitionFollowupPosted],
   );
 
   async function send() {
@@ -3772,12 +4171,14 @@ const ChatTab = React.forwardRef<
     setIsSending(true);
 
     try {
+      const baseCoachSystem =
+        'Du er en personlig treningsrådgiver (PRT) for en løper som også driver med styrketrening. Brukeren driver KUN med løping og styrke – ikke triatlon, sykling eller svømming. Ikke foreslå sykkel-, svømme- eller triatlonøkter. Svar på spørsmål om trening, løping, styrke, restitusjon, pulssoner og planlegging. Når brukeren ber om et løpeprogram over flere uker (eller har et tydelig tidsbegrenset mål), kaller du verktøyet create_running_program slik at øktene kan lagres som sjekkliste i appen. Når brukeren har et hovedløp eller oppgitt konkurranse, fyll valgfrie feltene main_race_name og main_race_date (YYYY-MM-DD) i create_running_program slik at appen og du husker datoen. For create_running_program: klassifiser hver planlagte løpeøkt med nøyaktig én workout_type blant de fire som i appen ved manuell løpelogging: «Rolig løpetur», «Terkeløkt», «Intervaller», «Konkurranse». Velg typen ut fra øktens hovedformål (varig rolig grunnlag, terskel/tempo, intervaller, eller konkurranse/test). workout_type blir øktens tittel i sjekklisten; skriv konkrete detaljer (tid, distanse, soner, drag) kun i description. For korte ukeplaner (noen dager) kan create_workout_plan brukes. Strava-data kan hentes med get_training_summary når det er relevant. Etter et verktøykall: oppsummer resultatet kort og vennlig for brukeren (3–7 punkter ved plan), uten å sitere rå JSON eller interne feltnavn. Vær konkret og basert på treningslære. Bruk norsk, vær varm og motiverende, men hold svarene korte og presise.';
+      const coachSystem = `${baseCoachSystem}${buildCompetitionCoachContext(runningPrograms)}`;
       const payload = {
         messages: [
           {
             role: 'system',
-            content:
-              'Du er en personlig treningsrådgiver (PRT) for en løper som også driver med styrketrening. Brukeren driver KUN med løping og styrke – ikke triatlon, sykling eller svømming. Ikke foreslå sykkel-, svømme- eller triatlonøkter. Svar på spørsmål om trening, løping, styrke, restitusjon, pulssoner og planlegging. Når brukeren ber om et løpeprogram over flere uker (eller har et tydelig tidsbegrenset mål), kaller du verktøyet create_running_program slik at øktene kan lagres som sjekkliste i appen. For create_running_program: klassifiser hver planlagte løpeøkt med nøyaktig én workout_type blant de fire som i appen ved manuell løpelogging: «Rolig løpetur», «Terkeløkt», «Intervaller», «Konkurranse». Velg typen ut fra øktens hovedformål (varig rolig grunnlag, terskel/tempo, intervaller, eller konkurranse/test). workout_type blir øktens tittel i sjekklisten; skriv konkrete detaljer (tid, distanse, soner, drag) kun i description. For korte ukeplaner (noen dager) kan create_workout_plan brukes. Strava-data kan hentes med get_training_summary når det er relevant. Etter et verktøykall: oppsummer resultatet kort og vennlig for brukeren (3–7 punkter ved plan), uten å sitere rå JSON eller interne feltnavn. Vær konkret og basert på treningslære. Bruk norsk, vær varm og motiverende, men hold svarene korte og presise.',
+            content: coachSystem,
           },
           ...[userMsg, ...messages]
             .slice(0, 20)
@@ -3881,6 +4282,14 @@ const ChatTab = React.forwardRef<
             <View style={styles.runningProgramPreview}>
               <Text style={styles.runningProgramPreviewTitle}>{rp.title}</Text>
               <Text style={styles.runningProgramPreviewGoal}>{rp.goalSummary}</Text>
+              {rp.competitionName || rp.competitionDate ? (
+                <Text style={styles.runningProgramPreviewCompetition}>
+                  🏁{' '}
+                  {[rp.competitionName, rp.competitionDate ? formatNorwegianDate(rp.competitionDate) : null]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </Text>
+              ) : null}
               <Text style={styles.runningProgramPreviewMeta}>
                 {rp.weeks} uker · {rp.sessions.length} økter i planen
               </Text>
@@ -3949,7 +4358,6 @@ const ChatTab = React.forwardRef<
   }
 
   return (
-    <>
     <View style={{ flex: 1, gap: 12 }}>
       <View style={styles.chatHeader}>
         <Text style={styles.chatTitle}>Din personlige trener</Text>
@@ -4025,189 +4433,6 @@ const ChatTab = React.forwardRef<
           </View>
       </View>
     </View>
-
-      <Modal visible={settingsModalOpen} animationType="slide" onRequestClose={onSettingsModalClose}>
-        <SafeAreaView style={styles.modalSafe}>
-          <View style={styles.modalHeader}>
-            <Text style={styles.modalTitle}>Innstillinger</Text>
-            <Pressable onPress={onSettingsModalClose} style={styles.modalClose}>
-              <Text style={styles.modalCloseText}>Lukk</Text>
-            </Pressable>
-          </View>
-          <ScrollView contentContainerStyle={styles.modalContent} keyboardShouldPersistTaps="handled">
-            <Text style={styles.fieldLabel}>Konto</Text>
-            <View style={{ gap: 4 }}>
-              <Text style={styles.muted}>
-                {authUser?.hasPassword || authUser?.email
-                  ? `Innlogget med e-post: ${authUser.email || '(ukjent)'}. Økt og brukerdata ligger på serveren (Redis).`
-                  : 'Du bruker en anonym økt (ingen e-post eller passord). Data knyttes til denne økten på serveren.'}
-              </Text>
-              {authUser?.stravaAthleteId ? (
-                <Text style={styles.muted}>
-                  Strava-konto koblet til (athlete #{authUser.stravaAthleteId}
-                  {authUser.stravaAthleteName ? ` · ${authUser.stravaAthleteName}` : ''}).
-                </Text>
-              ) : (
-                <Text style={styles.muted}>Ingen Strava-konto koblet til ennå.</Text>
-              )}
-            </View>
-            <Pressable
-              onPress={() => {
-                void Haptics.selectionAsync();
-                Alert.alert(
-                  'Logge ut?',
-                  'Sesjonen avsluttes på serveren. Du må logge inn på nytt, bruke Strava eller velge anonym økt for å fortsette.',
-                  [
-                    { text: 'Avbryt', style: 'cancel' },
-                    {
-                      text: 'Logg ut',
-                      style: 'destructive',
-                      onPress: () => {
-                        void signOut();
-                        onSettingsModalClose();
-                      },
-                    },
-                  ],
-                );
-              }}
-              style={[styles.dangerButton, { marginTop: 12 }]}
-            >
-              <Text style={styles.dangerButtonText}>Logg ut av appen</Text>
-            </Pressable>
-
-            <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Strava</Text>
-            <Text style={styles.muted}>
-              Koble til din egen Strava-konto for å hente aktiviteter og statistikk. Vi lagrer
-              tokenet ditt trygt knyttet til kontoen din på serveren.
-            </Text>
-            <View style={{ flexDirection: 'row', gap: 10 }}>
-              <Pressable
-                onPress={async () => {
-                  void Haptics.selectionAsync();
-                  await auth.openStravaConnect();
-                }}
-                style={[styles.secondaryButtonFull, { flex: 1 }]}
-              >
-                <Text style={styles.secondaryButtonText}>
-                  {authUser?.stravaAthleteId ? 'Koble på nytt' : 'Koble til Strava'}
-                </Text>
-              </Pressable>
-              <Pressable
-                onPress={async () => {
-                  void Haptics.selectionAsync();
-                  const keysToClear = [
-                    userKey(STRAVA_CACHE_KEY, userId),
-                    userKey(STRAVA_STATS_CACHE_KEY, userId),
-                    userKey(STRAVA_BEST_EFFORTS_CACHE_KEY, userId),
-                    userKey(STRAVA_CONNECTED_KEY, userId),
-                    userKey(STRAVA_SEEN_IDS_KEY, userId),
-                  ];
-                  await Promise.all(
-                    keysToClear.map((k) => AsyncStorage.removeItem(k).catch(() => undefined)),
-                  );
-                  try {
-                    await apiFetch('/strava/best-efforts/reset', { method: 'POST', ignoreAuthFailure: true });
-                  } catch {
-                    // ignore — local clear already happened
-                  }
-                  Alert.alert(
-                    'Nullstilt',
-                    'Strava-cachen for denne kontoen er slettet lokalt og på serveren. For å koble helt fra må du evt. revoke på strava.com/settings/apps.',
-                  );
-                }}
-                style={[styles.dangerButton, { flex: 1 }]}
-              >
-                <Text style={styles.dangerButtonText}>Nullstill cache</Text>
-              </Pressable>
-            </View>
-
-            <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Chat-historikk</Text>
-            <Pressable
-              onPress={() => {
-                void Haptics.selectionAsync();
-                Alert.alert(
-                  'Tøm chat-historikk?',
-                  'Alle meldinger i chatten slettes. Lagrede løpeprogrammer under fanen Løpeprogram beholdes.',
-                  [
-                    { text: 'Avbryt', style: 'cancel' },
-                    {
-                      text: 'Tøm',
-                      style: 'destructive',
-                      onPress: async () => {
-                        const welcome: ChatMessage = {
-                          id: `${Date.now()}-welcome`,
-                          role: 'assistant',
-                          text:
-                            'Hei! Jeg er din personlige trener. Jeg kan svare på spørsmål om løping og trening, lage løpeprogrammer du kan lagre som sjekkliste under fanen Løpeprogram, og hente oversikt fra Strava når det er koblet til. Hva lurer du på i dag?',
-                          createdAt: Date.now(),
-                        };
-                        setMessages([welcome]);
-                        try {
-                          await AsyncStorage.setItem(chatStorageKey, JSON.stringify([welcome]));
-                        } catch {
-                          // ignore
-                        }
-                        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                        onSettingsModalClose();
-                      },
-                    },
-                  ],
-                );
-              }}
-              style={styles.dangerButton}
-            >
-              <Text style={styles.dangerButtonText}>Tøm chat-historikk</Text>
-            </Pressable>
-
-            <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Avansert: server-adresse</Text>
-            <Text style={styles.muted}>
-              Brukes bare av utviklere. Standardverdi er fra app-konfigurasjonen (Vercel) eller{' '}
-              <Text style={{ fontWeight: '800' }}>http://localhost:8787</Text> når du kjører backend
-              lokalt.
-            </Text>
-            <TextInput
-              value={serverUrl}
-              onChangeText={setServerUrl}
-              autoCapitalize="none"
-              autoCorrect={false}
-              style={styles.input}
-            />
-            <View style={{ flexDirection: 'row', gap: 10 }}>
-              <Pressable
-                onPress={() => {
-                  void Haptics.selectionAsync();
-                  resetToDefaultServerUrl();
-                }}
-                style={[styles.secondaryButtonFull, { flex: 1 }]}
-              >
-                <Text style={styles.secondaryButtonText}>Auto-oppdag</Text>
-              </Pressable>
-              <Pressable
-                onPress={async () => {
-                  void Haptics.selectionAsync();
-                  try {
-                    const resp = await apiFetch('/health', { skipAuth: true });
-                    if (resp.ok) {
-                      Alert.alert('Tilkoblet', `Serveren svarer på ${chatApiBase}.`);
-                    } else {
-                      Alert.alert('Feil', `Serveren svarte med status ${resp.status}.`);
-                    }
-                  } catch (e: any) {
-                    Alert.alert(
-                      'Ingen kontakt',
-                      `Kunne ikke nå ${chatApiBase}.\n\nFeil: ${String(e?.message || e)}`,
-                    );
-                  }
-                }}
-                style={[styles.primaryButtonFull, { flex: 1 }]}
-              >
-                <Text style={styles.primaryButtonText}>Test tilkobling</Text>
-              </Pressable>
-            </View>
-          </ScrollView>
-        </SafeAreaView>
-      </Modal>
-    </>
   );
 });
 
@@ -4358,6 +4583,13 @@ function toDateStr(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
+/** Lokalt kalenderdato for «i går», YYYY-MM-DD (oppfølging etter konkurranse). */
+function yesterdayYyyyMmDd(): string {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  return toDateStr(d);
+}
+
 function formatNorwegianDate(s: string): string {
   if (!s) return '';
   try {
@@ -4369,6 +4601,26 @@ function formatNorwegianDate(s: string): string {
   } catch {
     return s;
   }
+}
+
+function buildCompetitionCoachContext(programs: SavedRunningProgram[]): string {
+  const lines: string[] = [];
+  for (const p of programs) {
+    const name = p.competitionName?.trim();
+    const date = p.competitionDate?.trim();
+    if (!name && !date) continue;
+    const dateFmt = date ? formatNorwegianDate(date) : 'dato ikke satt';
+    const label = name || 'Konkurranse';
+    lines.push(
+      `• Program «${p.title}»: ${label}${date ? ` — ${dateFmt} (${date})` : ''}`,
+    );
+  }
+  if (lines.length === 0) return '';
+  return (
+    '\n\nBrukerens registrerte konkurranse(r) i løpeprogram:\n' +
+    lines.join('\n') +
+    '\nTa hensyn til dato og navn når du planlegger og følger opp. Unngå å gjenta samme oppfølgingsspørsmål samme dag hvis det allerede er sendt en egen melding om konkurransen.'
+  );
 }
 
 function displayDate(s: string): string {
@@ -4390,7 +4642,7 @@ function formatChatTime(ts: number): string {
 function showRunningProgramHelp() {
   Alert.alert(
     'Løpeprogram og Chat',
-    'Du kan opprette et program her med «Nytt løpeprogram», eller få hjelp i fanen Chat: beskriv målet eller ønsket plan. Når du får et forslag til løpeprogram i chatten, trykk «Lagre som løpeprogram» på svaret – da legges programmet inn her.',
+    'Du kan opprette et program her med «Nytt løpeprogram», eller få hjelp i fanen Chat: beskriv målet eller ønsket plan. Når du får et forslag til løpeprogram i chatten, trykk «Lagre som løpeprogram» på svaret – da legges programmet inn her. Under redigering kan du legge inn konkurranse og dato, så treneren i chatten ser det og kan følge opp dagen etter.',
     [{ text: 'OK' }],
   );
 }
@@ -4925,6 +5177,10 @@ function SessionModal({
 
 function AuthenticatedApp() {
   const userId = useUserId();
+  const auth = useAuth();
+  const { serverUrl, setServerUrl, resetToDefaultServerUrl, user: authUser, signOut } = auth;
+  const chatApiBase = serverUrl;
+  const chatStorageKey = userKey(CHAT_STORAGE_KEY, userId);
   const sessionsKey = userKey(STORAGE_KEY, userId);
   const runningProgramsKey = userKey(RUNNING_PROGRAMS_KEY, userId);
   const stravaCacheKeyForUser = userKey(STRAVA_CACHE_KEY, userId);
@@ -5042,6 +5298,10 @@ function AuthenticatedApp() {
     setChatSettingsOpen(true);
   }, []);
 
+  const closeAppSettings = useCallback(() => {
+    setChatSettingsOpen(false);
+  }, []);
+
   const dailyQuote = useMemo(() => {
     const index = new Date().getDate() % motivationalQuotes.length;
     return motivationalQuotes[index];
@@ -5125,6 +5385,21 @@ function AuthenticatedApp() {
     if (!runningProgramsLoaded) return;
     AsyncStorage.setItem(runningProgramsKey, JSON.stringify(runningPrograms)).catch(() => undefined);
   }, [runningPrograms, runningProgramsLoaded, runningProgramsKey]);
+
+  useEffect(() => {
+    if (!runningProgramsLoaded) return;
+    void chatRef.current?.maybeSendCompetitionFollowups(runningPrograms);
+  }, [runningPrograms, runningProgramsLoaded]);
+
+  useEffect(() => {
+    if (!runningProgramsLoaded) return;
+    const sub = AppState.addEventListener('change', (s) => {
+      if (s === 'active') {
+        void chatRef.current?.maybeSendCompetitionFollowups(runningPrograms);
+      }
+    });
+    return () => sub.remove();
+  }, [runningPrograms, runningProgramsLoaded]);
 
   function updateField<K extends keyof SessionForm>(field: K, value: SessionForm[K]) {
     setForm((prev) => ({ ...prev, [field]: value }));
@@ -5312,12 +5587,17 @@ function AuthenticatedApp() {
       };
     });
     const now = Date.now();
+    const cn = payload.competitionName?.trim();
+    const cd = payload.competitionDate?.trim();
     setRunningPrograms((prev) => [
       {
         id,
         title: payload.title,
         goalSummary: payload.goalSummary,
         weeks: payload.weeks,
+        competitionName: cn || undefined,
+        competitionDate:
+          cd && /^\d{4}-\d{2}-\d{2}$/.test(cd) ? cd : undefined,
         createdAt: now,
         updatedAt: now,
         items,
@@ -5343,11 +5623,41 @@ function AuthenticatedApp() {
     setRunningPrograms((prev) => prev.filter((p) => p.id !== programId));
   }
 
+  function moveRunningProgramInTab(
+    tab: 'active' | 'completed',
+    programId: string,
+    direction: 'up' | 'down',
+  ) {
+    setRunningPrograms((prev) => {
+      const now = Date.now();
+      const isCompleted = (p: SavedRunningProgram) =>
+        p.items.length > 0 && p.items.every((it) => it.done);
+      const isVisibleForTab = (p: SavedRunningProgram) =>
+        tab === 'completed' ? isCompleted(p) : !isCompleted(p);
+      const visible = prev.filter(isVisibleForTab);
+      const idx = visible.findIndex((p) => p.id === programId);
+      if (idx < 0) return prev;
+      const j = direction === 'up' ? idx - 1 : idx + 1;
+      if (j < 0 || j >= visible.length) return prev;
+      const swapped = [...visible];
+      const tmp = swapped[idx];
+      swapped[idx] = swapped[j];
+      swapped[j] = tmp;
+      let i = 0;
+      return prev.map((p) => {
+        if (!isVisibleForTab(p)) return p;
+        return { ...swapped[i++], updatedAt: now };
+      });
+    });
+  }
+
   function saveProgramFromForm(payload: {
     mode: 'create' | 'edit';
     programId?: string;
     title: string;
     goalSummary: string;
+    competitionName?: string;
+    competitionDate?: string;
     weeks: number;
     items: Array<{
       id?: string;
@@ -5360,6 +5670,12 @@ function AuthenticatedApp() {
       workoutType?: string;
     }>;
   }) {
+    const cn = payload.competitionName?.trim();
+    const cd = payload.competitionDate?.trim();
+    const competitionName = cn || undefined;
+    const competitionDate =
+      cd && /^\d{4}-\d{2}-\d{2}$/.test(cd) ? cd : undefined;
+
     if (payload.mode === 'create') {
       const id = `rp-${Date.now()}`;
       const items: SavedProgramItem[] = payload.items.map((it, i) => ({
@@ -5379,6 +5695,8 @@ function AuthenticatedApp() {
           title: payload.title,
           goalSummary: payload.goalSummary || 'Eget program',
           weeks: payload.weeks,
+          competitionName,
+          competitionDate,
           createdAt: now,
           updatedAt: now,
           items,
@@ -5407,6 +5725,8 @@ function AuthenticatedApp() {
           title: payload.title,
           goalSummary: payload.goalSummary,
           weeks: payload.weeks,
+          competitionName,
+          competitionDate,
           updatedAt: Date.now(),
           items,
         };
@@ -5538,10 +5858,12 @@ function AuthenticatedApp() {
               <View style={styles.chatLayoutBody}>
                 <ChatTab
                   ref={chatRef}
-                  settingsModalOpen={chatSettingsOpen}
-                  onSettingsModalClose={() => setChatSettingsOpen(false)}
+                  runningPrograms={runningPrograms}
                   onSaveRunningProgram={saveRunningProgramFromChat}
                   onAfterProgramSaved={() => handleTabPress('Løpeprogram')}
+                  onCompetitionFollowupPosted={() => {
+                    if (activeTabRef.current !== 'Chat') setHasUnreadChat(true);
+                  }}
                 />
               </View>
             </View>
@@ -5567,6 +5889,7 @@ function AuthenticatedApp() {
                 onToggleItem={toggleRunningProgramItem}
                 onDeleteProgram={deleteRunningProgram}
                 onSaveProgram={saveProgramFromForm}
+                onMoveRunningProgramInTab={moveRunningProgramInTab}
               />
             </ScrollView>
           </View>
@@ -5627,7 +5950,7 @@ function AuthenticatedApp() {
                     </Text>
                   </Card>
                 </View>
-                <StravaBestEffortsCard />
+                <StravaBestEffortsCard refreshSignal={refreshSignal} />
                 <StatisticsTab
                   totals={totals}
                   latestWeather={latestWeather}
@@ -5685,6 +6008,191 @@ function AuthenticatedApp() {
         onSubmit={handleSubmit}
         onFieldChange={updateField}
       />
+
+      <Modal visible={chatSettingsOpen} animationType="slide" onRequestClose={closeAppSettings}>
+        <SafeAreaView style={styles.modalSafe}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Innstillinger</Text>
+            <Pressable onPress={closeAppSettings} style={styles.modalClose}>
+              <Text style={styles.modalCloseText}>Lukk</Text>
+            </Pressable>
+          </View>
+          <ScrollView
+            contentContainerStyle={[styles.modalContent, { flexGrow: 1 }]}
+            keyboardShouldPersistTaps="handled"
+          >
+            <Text style={styles.fieldLabel}>Konto</Text>
+            <View style={{ gap: 4 }}>
+              <Text style={styles.muted}>
+                {authUser?.hasPassword || authUser?.email
+                  ? `Innlogget med e-post: ${authUser.email || '(ukjent)'}. Økt og brukerdata ligger på serveren (Redis).`
+                  : 'Du bruker en anonym økt (ingen e-post eller passord). Data knyttes til denne økten på serveren.'}
+              </Text>
+              {authUser?.stravaAthleteId ? (
+                <Text style={styles.muted}>
+                  Strava-konto koblet til (athlete #{authUser.stravaAthleteId}
+                  {authUser.stravaAthleteName ? ` · ${authUser.stravaAthleteName}` : ''}).
+                </Text>
+              ) : (
+                <Text style={styles.muted}>Ingen Strava-konto koblet til ennå.</Text>
+              )}
+            </View>
+
+            <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Strava</Text>
+            <Text style={styles.muted}>
+              Koble til din egen Strava-konto for å hente aktiviteter og statistikk. Vi lagrer tokenet ditt trygt
+              knyttet til kontoen din på serveren.
+            </Text>
+            <View style={{ flexDirection: 'row', gap: 10 }}>
+              <Pressable
+                onPress={async () => {
+                  void Haptics.selectionAsync();
+                  await auth.openStravaConnect();
+                }}
+                style={[styles.secondaryButtonFull, { flex: 1 }]}
+              >
+                <Text style={styles.secondaryButtonText}>
+                  {authUser?.stravaAthleteId ? 'Koble på nytt' : 'Koble til Strava'}
+                </Text>
+              </Pressable>
+              <Pressable
+                onPress={async () => {
+                  void Haptics.selectionAsync();
+                  const keysToClear = [
+                    userKey(STRAVA_CACHE_KEY, userId),
+                    userKey(STRAVA_STATS_CACHE_KEY, userId),
+                    userKey(STRAVA_BEST_EFFORTS_CACHE_KEY, userId),
+                    userKey(STRAVA_CONNECTED_KEY, userId),
+                    userKey(STRAVA_SEEN_IDS_KEY, userId),
+                  ];
+                  await Promise.all(keysToClear.map((k) => AsyncStorage.removeItem(k).catch(() => undefined)));
+                  try {
+                    await apiFetch('/strava/best-efforts/reset', { method: 'POST', ignoreAuthFailure: true });
+                  } catch {
+                    // ignore — local clear already happened
+                  }
+                  Alert.alert(
+                    'Nullstilt',
+                    'Strava-cachen for denne kontoen er slettet lokalt og på serveren. For å koble helt fra må du evt. revoke på strava.com/settings/apps.',
+                  );
+                }}
+                style={[styles.dangerButton, { flex: 1 }]}
+              >
+                <Text style={styles.dangerButtonText}>Nullstill cache</Text>
+              </Pressable>
+            </View>
+
+            <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Chat-historikk</Text>
+            <Pressable
+              onPress={() => {
+                void Haptics.selectionAsync();
+                Alert.alert(
+                  'Tøm chat-historikk?',
+                  'Alle meldinger i chatten slettes. Lagrede løpeprogrammer under fanen Løpeprogram beholdes.',
+                  [
+                    { text: 'Avbryt', style: 'cancel' },
+                    {
+                      text: 'Tøm',
+                      style: 'destructive',
+                      onPress: async () => {
+                        const welcome: ChatMessage = {
+                          id: `${Date.now()}-welcome`,
+                          role: 'assistant',
+                          text:
+                            'Hei! Jeg er din personlige trener. Jeg kan svare på spørsmål om løping og trening, lage løpeprogrammer du kan lagre som sjekkliste under fanen Løpeprogram, og hente oversikt fra Strava når det er koblet til. Hva lurer du på i dag?',
+                          createdAt: Date.now(),
+                        };
+                        try {
+                          await AsyncStorage.setItem(chatStorageKey, JSON.stringify([welcome]));
+                        } catch {
+                          // ignore
+                        }
+                        chatRef.current?.resetChatToWelcome();
+                        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                        closeAppSettings();
+                      },
+                    },
+                  ],
+                );
+              }}
+              style={styles.dangerButton}
+            >
+              <Text style={styles.dangerButtonText}>Tøm chat-historikk</Text>
+            </Pressable>
+
+            <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Avansert: server-adresse</Text>
+            <Text style={styles.muted}>
+              Brukes bare av utviklere. Standardverdi er fra app-konfigurasjonen (Vercel) eller{' '}
+              <Text style={{ fontWeight: '800' }}>http://localhost:8787</Text> når du kjører backend lokalt.
+            </Text>
+            <TextInput
+              value={serverUrl}
+              onChangeText={setServerUrl}
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={styles.input}
+            />
+            <View style={{ flexDirection: 'row', gap: 10 }}>
+              <Pressable
+                onPress={() => {
+                  void Haptics.selectionAsync();
+                  resetToDefaultServerUrl();
+                }}
+                style={[styles.secondaryButtonFull, { flex: 1 }]}
+              >
+                <Text style={styles.secondaryButtonText}>Auto-oppdag</Text>
+              </Pressable>
+              <Pressable
+                onPress={async () => {
+                  void Haptics.selectionAsync();
+                  try {
+                    const resp = await apiFetch('/health', { skipAuth: true });
+                    if (resp.ok) {
+                      Alert.alert('Tilkoblet', `Serveren svarer på ${chatApiBase}.`);
+                    } else {
+                      Alert.alert('Feil', `Serveren svarte med status ${resp.status}.`);
+                    }
+                  } catch (e: any) {
+                    Alert.alert(
+                      'Ingen kontakt',
+                      `Kunne ikke nå ${chatApiBase}.\n\nFeil: ${String(e?.message || e)}`,
+                    );
+                  }
+                }}
+                style={[styles.primaryButtonFull, { flex: 1 }]}
+              >
+                <Text style={styles.primaryButtonText}>Test tilkobling</Text>
+              </Pressable>
+            </View>
+
+            <View style={{ marginTop: 'auto', paddingTop: 28, alignSelf: 'stretch' }}>
+              <Pressable
+                onPress={() => {
+                  void Haptics.selectionAsync();
+                  Alert.alert(
+                    'Logge ut?',
+                    'Sesjonen avsluttes på serveren. Du må logge inn på nytt, bruke Strava eller velge anonym økt for å fortsette.',
+                    [
+                      { text: 'Avbryt', style: 'cancel' },
+                      {
+                        text: 'Logg ut',
+                        style: 'destructive',
+                        onPress: () => {
+                          void signOut();
+                          closeAppSettings();
+                        },
+                      },
+                    ],
+                  );
+                }}
+                style={[styles.dangerButton, { alignSelf: 'stretch' }]}
+              >
+                <Text style={[styles.dangerButtonText, { textAlign: 'center' }]}>Logg ut av appen</Text>
+              </Pressable>
+            </View>
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
 
       {toast ? <Toast key={toast.id} message={toast.message} /> : null}
     </View>
@@ -6168,6 +6676,12 @@ const styles = StyleSheet.create({
     color: '#475569',
     lineHeight: 18,
   },
+  runningProgramPreviewCompetition: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#9d174d',
+    lineHeight: 18,
+  },
   runningProgramPreviewMeta: {
     fontSize: 11,
     fontWeight: '800',
@@ -6239,6 +6753,13 @@ const styles = StyleSheet.create({
     color: '#0f172a',
     lineHeight: 18,
   },
+  programCompetitionLine: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#9d174d',
+    lineHeight: 18,
+    marginTop: 4,
+  },
   programCard: {
     backgroundColor: '#ffffff',
     borderRadius: 16,
@@ -6263,6 +6784,53 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'flex-end',
     flexShrink: 0,
+  },
+  programReorderHint: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#94a3b8',
+    marginTop: 2,
+    lineHeight: 17,
+  },
+  programReorderModeIconButton: {
+    width: 40,
+    minHeight: 42,
+    marginLeft: 2,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+    alignSelf: 'stretch',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    backgroundColor: '#ffffff',
+  },
+  programReorderModeIconButtonOn: {
+    borderColor: '#C45872',
+    backgroundColor: '#fff5f5',
+  },
+  programReorderStepper: {
+    flexDirection: 'column',
+    justifyContent: 'flex-start',
+    alignItems: 'center',
+    gap: 0,
+    flexShrink: 0,
+    alignSelf: 'flex-start',
+    paddingTop: 2,
+  },
+  programReorderStepperBtn: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    minWidth: 28,
+    alignItems: 'center',
+  },
+  programReorderStepperText: {
+    fontSize: 15,
+    fontWeight: '900',
+    color: '#C45872',
+  },
+  programReorderStepperTextDisabled: {
+    color: '#e2e8f0',
   },
   programUpdatedAt: {
     fontSize: 10,
