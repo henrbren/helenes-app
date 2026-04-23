@@ -75,9 +75,30 @@ function isLikelyBundlerOrStaticDevUrl(url: string): boolean {
   }
 }
 
+/**
+ * Fjerner vanlig copy-paste-feil: brukere limer inn test-URL …/health eller …/chat.
+ * Da ville joinApiUrl(base, '/health') blitt …/health/health og test/chat feilet.
+ */
+function stripMistakenApiPathFromBase(url: string): string {
+  const t = url.trim();
+  try {
+    const u = new URL(t);
+    const path = (u.pathname || '/').replace(/\/{2,}/g, '/').replace(/\/+$/, '') || '/';
+    if (path === '/health' || path === '/chat' || path === '/chat/stream') {
+      u.pathname = '/';
+      return normalizeApiBase(u.href);
+    }
+  } catch {
+    // ugyldig URL — returner uendret
+  }
+  return t;
+}
+
 /** Erstatter feilaktig lagret «Metro»-URL med standard API-adresse. */
 function coerceChatServerUrl(url: string): string {
-  return isLikelyBundlerOrStaticDevUrl(url) ? resolveDefaultServerUrl() : normalizeApiBase(url);
+  const stripped = stripMistakenApiPathFromBase(url);
+  const normalized = normalizeApiBase(stripped);
+  return isLikelyBundlerOrStaticDevUrl(normalized) ? resolveDefaultServerUrl() : normalized;
 }
 
 /** Normaliser base-URL (trim, ingen trailing slash). */
@@ -680,7 +701,7 @@ async function getServerUrl(): Promise<string> {
         const savedIsLocalhost = /(localhost|127\.0\.0\.1)/.test(cfg.serverUrl);
         const detected = resolveDefaultServerUrl();
         const detectedIsLan = !/(localhost|127\.0\.0\.1)/.test(detected);
-        return savedIsLocalhost && detectedIsLan ? detected : cfg.serverUrl;
+        return savedIsLocalhost && detectedIsLan ? detected : coerceChatServerUrl(cfg.serverUrl);
       }
     }
   } catch {
@@ -3668,7 +3689,9 @@ const ChatTab = React.forwardRef<
                 // If we're on a physical device (auto-detected URL is on the LAN), always
                 // prefer the freshly detected LAN URL — saved URL may point to localhost or
                 // a stale IP from a previous dev session.
-                setServerUrl(detectedIsLan ? detected : savedIsLocalhost ? detected : cfg.serverUrl);
+                setServerUrl(
+                  detectedIsLan ? detected : savedIsLocalhost ? detected : coerceChatServerUrl(cfg.serverUrl),
+                );
               }
             }
           }
@@ -4053,8 +4076,10 @@ const ChatTab = React.forwardRef<
             <Text style={styles.fieldLabel}>Server-adresse</Text>
             <Text style={styles.muted}>
               Standard er API fra app-konfig (Vercel) eller <Text style={{ fontWeight: '800' }}>http://localhost:8787</Text> når du kjører{' '}
-              <Text style={{ fontWeight: '800' }}>backend</Text> lokalt. <Text style={{ fontWeight: '800' }}>Ikke</Text> bruk port{' '}
-              <Text style={{ fontWeight: '800' }}>8081</Text> — det er bare Expo/Metro (JavaScript), ikke chat-serveren. iOS Simulator:{' '}
+              <Text style={{ fontWeight: '800' }}>backend</Text> lokalt. Skriv kun <Text style={{ fontWeight: '800' }}>rotadressen</Text> (f.eks.{' '}
+              <Text style={{ fontWeight: '800' }}>https://helenes-app.vercel.app</Text>) — <Text style={{ fontWeight: '800' }}>ikke</Text> ta med{' '}
+              <Text style={{ fontWeight: '800' }}>/health</Text> eller <Text style={{ fontWeight: '800' }}>/chat</Text>; de legges til automatisk.{' '}
+              <Text style={{ fontWeight: '800' }}>Ikke</Text> bruk port <Text style={{ fontWeight: '800' }}>8081</Text> (Expo/Metro). iOS Simulator:{' '}
               <Text style={{ fontWeight: '800' }}>http://localhost:8787</Text>. Fysisk iPhone (samme Wi‑Fi): Mac-ens IP, f.eks.{' '}
               <Text style={{ fontWeight: '800' }}>http://192.168.1.23:8787</Text>.
             </Text>
