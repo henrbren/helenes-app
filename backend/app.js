@@ -531,14 +531,18 @@ function getTools() {
       function: {
         name: 'create_running_program',
         description:
-          'Lag et strukturert løpeprogram med én rad per planlagt økt. Bruk når brukeren ber om et program over flere uker (typisk 4–16 uker), oppløp mot konkurranse, eller konkrete mål (f.eks. 10 km under 50 min). Fyll sessions med alle økter sortert etter uke (uke 1 først). For hver økt velg én av de fire løpeøkttypene (samme som manuell logging i appen); workout_type blir tittel på økten i sjekklisten. Detaljer (varighet, intensitet, struktur) kun i description.',
+          'Lag et strukturert løpeprogram med én rad per planlagt økt. Kun løpeøkter i sessions — hver rad er én løpeøkt med workout_type som tittel. Ikke legg styrke, core, gym eller «etter løpetur: styrke» inn i noen økts description; det tilhører ikke løpesjekklisten. Eventuell styrkeanbefaling kan du skrive i det vanlige chat-svaret, ikke i verktøydata. Fyll sessions sortert etter uke (uke 1 først). Detaljer (varighet, distanse, intensitet, puls, struktur) kun i description. Viktig: når main_race_date er satt, skal weeks aldri være større enn antall uker fra i dag til konkurransen (ca. ceil(dager/7) fra nåværende dato i Norge); programmet skal ikke fortsette etter konkurranseuken.',
         parameters: {
           type: 'object',
           additionalProperties: false,
           properties: {
             title: { type: 'string', description: 'Kort navn, f.eks. "12 uker mot 10 km sub-50".' },
             goal_summary: { type: 'string', description: 'Brukerens mål i én–to setninger.' },
-            weeks: { type: 'number', description: 'Antall uker programmet varer (1–52).' },
+            weeks: {
+              type: 'number',
+              description:
+                'Antall uker programmet varer (1–52). Hvis main_race_date er satt: maks antall uker til og med uken med konkurransen (teller fra i dag, Norge-tid); ikke lengre.',
+            },
             main_race_name: {
               type: 'string',
               description:
@@ -546,12 +550,13 @@ function getTools() {
             },
             main_race_date: {
               type: 'string',
-              description: 'Valgfritt: konkurransedato på format YYYY-MM-DD (samme som i appen).',
+              description:
+                'Valgfritt: konkurransedato YYYY-MM-DD. Når satt, må weeks og alle session.week være innenfor tidsrommet frem til denne datoen (programmet skal ikke gå utover konkurransen).',
             },
             sessions: {
               type: 'array',
               description:
-                'Alle planlagte økter (typisk 3–6 økter per uke). Hver økt klassifiseres med workout_type; ingen egen fritekst-tittel.',
+                'Kun løpeøkter (typisk 3–6 per uke). Hver økt har workout_type som tittel. Ingen styrke-/core-/gym-notater i description — bare innhold for selve løpeøkta.',
               items: {
                 type: 'object',
                 additionalProperties: false,
@@ -570,7 +575,7 @@ function getTools() {
                   description: {
                     type: 'string',
                     description:
-                      'Konkret innhold: varighet, distanse, intensitet, pulssoner, intervallstruktur, pauser – ikke gjenta økttypen her som tittel.',
+                      'Kun løping: varighet, distanse, tempo/soner, puls, intervallstruktur, terreng, pauser. Ikke styrke, knebøy, core, utfall, vekter, styrkerom eller «supplér med styrke» — økta er allerede klassifisert som løpetype i workout_type.',
                   },
                 },
                 required: ['week', 'day_label', 'workout_type', 'description'],
@@ -628,6 +633,64 @@ function normalizeCreateRunningProgramArgs(args) {
       return { ...sess, workout_type: fixed };
     });
   }
+  return out;
+}
+
+const OSLO_TZ = 'Europe/Oslo';
+
+function todayYmdOslo() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: OSLO_TZ });
+}
+
+/** Kalenderdager mellom to YYYY-MM-DD (to - fra). */
+function calendarDaysBetweenYmd(fromYmd, toYmd) {
+  const [fy, fm, fd] = fromYmd.split('-').map(Number);
+  const [ty, tm, td] = toYmd.split('-').map(Number);
+  const from = Date.UTC(fy, fm - 1, fd);
+  const to = Date.UTC(ty, tm - 1, td);
+  return Math.round((to - from) / 86400000);
+}
+
+/**
+ * Maks antall uker programmet kan ha når det skal nå main_race_date (ikke lenger).
+ * Basert på dagens dato i Oslo og ceil(dager/7). Konkurranse i fortiden: ingen begrensning (null).
+ */
+function maxProgramWeeksThroughRaceDate(raceYmd) {
+  const today = todayYmdOslo();
+  const daysUntil = calendarDaysBetweenYmd(today, raceYmd);
+  if (daysUntil < 0) return null;
+  return Math.max(1, Math.ceil(daysUntil / 7));
+}
+
+/**
+ * Klipp weeks + økter slik at ingenting strekker seg utover uken som inneholder konkurransedato.
+ */
+function capRunningProgramToRaceDate(weeks, sessions, raceYmd) {
+  const cap = maxProgramWeeksThroughRaceDate(raceYmd);
+  if (cap == null || weeks <= cap) {
+    return { weeks, sessions, wasCapped: false };
+  }
+  const nextSessions = sessions.filter((s) => s.week <= cap);
+  return { weeks: cap, sessions: nextSessions, wasCapped: true };
+}
+
+/** Fjerner hele linjer som tydelig bare er styrke/core/gym — løpe-sjekklisten skal ikke blande inn det. */
+function stripStrengthLinesFromRunDescription(description) {
+  if (!description || typeof description !== 'string') return description;
+  const strengthLead =
+    /^(?:\+|•|-|\*)?\s*(?:evt\.?\s*)?(?:kort\s+)?(?:styrke|styrketrening|styrkeøkt|core|magetrening|gym|knebøy|markløft|utfall|vekttrening|styrkerom|pull[\s-]?ups?|push[\s-]?ups?|roing\s+maskin)\b/i;
+  const lines = description.split(/\r?\n/);
+  const kept = lines.filter((line) => {
+    const t = line.trim();
+    if (!t) return true;
+    if (strengthLead.test(t)) return false;
+    if (/^\s*(?:\+|eller|og\/eller)\s+styrke\b/i.test(t)) return false;
+    if (/etter\s+(?:løp|løpetur|økt|økta)\b[^.]{0,60}\bstyrke/i.test(t)) return false;
+    if (/supplér\s+(?:med\s+)?styrke/i.test(t)) return false;
+    return true;
+  });
+  let out = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (!out) return description.trim();
   return out;
 }
 
@@ -717,12 +780,41 @@ async function runToolCall(name, args, ctx) {
         .max(250),
     });
     const parsed = schema.parse(normalizeCreateRunningProgramArgs(args ?? {}));
-    for (const s of parsed.sessions) {
-      if (s.week > parsed.weeks) {
+
+    let programWeeks = parsed.weeks;
+    let programSessions = parsed.sessions;
+    if (parsed.main_race_date) {
+      const { weeks: w, sessions: sess, wasCapped } = capRunningProgramToRaceDate(
+        programWeeks,
+        programSessions,
+        parsed.main_race_date,
+      );
+      programWeeks = w;
+      programSessions = sess;
+      if (wasCapped) {
+        console.log(
+          `[create_running_program] capped weeks to ${programWeeks} (race ${parsed.main_race_date}, today Oslo ${todayYmdOslo()})`,
+        );
+      }
+    }
+
+    if (programSessions.length === 0) {
+      return {
+        kind: 'tool_card',
+        title: 'Kunne ikke lage program',
+        bullets: [
+          'Etter at programmet ble begrenset til ikke å gå utover konkurransedato, ble det ingen økter igjen.',
+          'Lag færre uker eller sørg for at øktene ligger i ukene før konkurransen.',
+        ],
+      };
+    }
+
+    for (const s of programSessions) {
+      if (s.week > programWeeks) {
         return {
           kind: 'tool_card',
           title: 'Kunne ikke lage program',
-          bullets: [`Ukenummer ${s.week} er høyere enn antall uker (${parsed.weeks}).`],
+          bullets: [`Ukenummer ${s.week} er høyere enn antall uker (${programWeeks}).`],
         };
       }
     }
@@ -730,18 +822,19 @@ async function runToolCall(name, args, ctx) {
       kind: 'running_program',
       title: parsed.title,
       goalSummary: parsed.goal_summary,
-      weeks: parsed.weeks,
+      weeks: programWeeks,
       ...(parsed.main_race_name?.trim()
         ? { competitionName: parsed.main_race_name.trim() }
         : {}),
       ...(parsed.main_race_date ? { competitionDate: parsed.main_race_date } : {}),
-      sessions: parsed.sessions.map((s) => {
+      sessions: programSessions.map((s) => {
         const wt = s.workout_type;
+        const description = stripStrengthLinesFromRunDescription(s.description);
         return {
           week: s.week,
           dayLabel: s.day_label,
           title: wt,
-          description: s.description,
+          description,
           workoutType: wt,
         };
       }),
