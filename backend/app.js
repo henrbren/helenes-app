@@ -36,10 +36,10 @@ import {
 const PORT = Number(process.env.PORT || 8787);
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 /** Gir modell nok plass til lange create_running_program-JSON (alle uker × økter). */
-const CHAT_TOOL_MAX_COMPLETION_TOKENS = Math.min(
-  16384,
-  Math.max(2048, Number(process.env.CHAT_MAX_COMPLETION_TOKENS || 8192)),
-);
+const _chatMaxTok = Number(process.env.CHAT_MAX_COMPLETION_TOKENS || 8192);
+const CHAT_TOOL_MAX_COMPLETION_TOKENS = Number.isFinite(_chatMaxTok)
+  ? Math.min(16384, Math.max(2048, _chatMaxTok))
+  : 8192;
 
 let openaiClient = null;
 function getOpenAI() {

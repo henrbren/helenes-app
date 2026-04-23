@@ -344,7 +344,47 @@ export async function apiFetch(path: string, options: ApiFetchOptions = {}): Pro
         const body = (await resp.clone().json()) as { code?: string };
         const code = body?.code;
         if (code === 'UNAUTHENTICATED' || code === 'SESSION_EXPIRED' || code === 'USER_GONE') {
-          onUnauthenticated();
+          // Én 401 kan skyldes kortvarig feil (Redis/serverless). Bekreft med /auth/me før utlogging.
+          const verifyUrl = joinApiUrl(base, '/auth/me');
+          const verifyHeaders: Record<string, string> = { Accept: 'application/json' };
+          if (currentSessionToken) verifyHeaders.Authorization = `Bearer ${currentSessionToken}`;
+          const verifyInit: RequestInit = {
+            method: 'GET',
+            headers: verifyHeaders,
+          };
+          if (Platform.OS === 'web' && typeof verifyUrl === 'string' && verifyUrl.startsWith('/')) {
+            verifyInit.credentials = 'include';
+          }
+          const vCtl = new AbortController();
+          const vTimer = setTimeout(() => vCtl.abort(), 8000);
+          let verifyState: 'session_ok' | 'session_bad' | 'inconclusive' = 'inconclusive';
+          try {
+            verifyInit.signal = vCtl.signal;
+            const verifyResp = await fetch(verifyUrl, verifyInit);
+            if (verifyResp.status === 200) verifyState = 'session_ok';
+            else if (verifyResp.status === 401) verifyState = 'session_bad';
+          } catch {
+            verifyState = 'inconclusive';
+          } finally {
+            clearTimeout(vTimer);
+          }
+          if (verifyState === 'session_ok') {
+            console.warn(
+              '[apiFetch] Ignoring 401 with',
+              code,
+              'because GET /auth/me still returns 200 (path:',
+              path,
+              ').',
+            );
+          } else if (verifyState === 'session_bad') {
+            onUnauthenticated();
+          } else {
+            console.warn(
+              '[apiFetch] 401 on',
+              path,
+              'but /auth/me verify inconclusive — not forcing logout.',
+            );
+          }
         }
       } catch {
         // Ukjent 401-format — ikke bytt bruker (unngå feil ved f.eks. Strava 401 med annen code).
