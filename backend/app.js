@@ -95,10 +95,29 @@ function selfBaseUrl(req) {
   return `${proto}://${host}`;
 }
 
-/** Må være identisk for /authorize og /token. Strava validerer mot «Authorization Callback Domain». */
+/**
+ * Må være identisk for /authorize og /token. Strava validerer mot «Authorization Callback Domain».
+ * På Vercel: hvis STRAVA_REDIRECT_URI peker til LAN/localhost (vanlig fra kopiert lokal .env), eller
+ * mangler, bruk produksjonsdomenet slik at preview-deploy og feilkonfigurerte env ikke gir invalid redirect_uri.
+ */
 function stravaRedirectUri(req) {
-  const fixed = process.env.STRAVA_REDIRECT_URI?.trim();
-  if (fixed) return fixed;
+  const fixedRaw = process.env.STRAVA_REDIRECT_URI?.trim() || '';
+  const prodHost = process.env.VERCEL_PROJECT_PRODUCTION_URL?.trim()
+    .replace(/^https?:\/\//i, '')
+    .replace(/\/$/, '');
+
+  if (process.env.VERCEL && prodHost) {
+    const prodCallback = `https://${prodHost}/strava/callback`;
+    const looksLikeLocalDev = (u) =>
+      /^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|127\.0\.0\.1|localhost)(:|\/|$)/i.test(
+        u,
+      );
+    if (!fixedRaw || looksLikeLocalDev(fixedRaw)) {
+      return prodCallback;
+    }
+  }
+
+  if (fixedRaw) return fixedRaw;
   return `${selfBaseUrl(req)}/strava/callback`;
 }
 
