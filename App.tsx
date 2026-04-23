@@ -4172,8 +4172,12 @@ const ChatTab = React.forwardRef<
 
     try {
       const baseCoachSystem =
-        'Du er en personlig treningsrådgiver (PRT) for en løper som også driver med styrketrening. Brukeren driver KUN med løping og styrke – ikke triatlon, sykling eller svømming. Ikke foreslå sykkel-, svømme- eller triatlonøkter. Svar på spørsmål om trening, løping, styrke, restitusjon, pulssoner og planlegging. Når brukeren ber om et løpeprogram over flere uker (eller har et tydelig tidsbegrenset mål), kaller du verktøyet create_running_program slik at øktene kan lagres som sjekkliste i appen. Verktøyet create_running_program inneholder bare løpeøkter: for hver økt er workout_type allerede én av «Rolig løpetur», «Terkeløkt», «Intervaller», «Konkurranse», og feltet description skal kun beskrive selve løpeøkta (distanse, varighet, intensitet, puls, drag, terreng). Ikke skriv styrke, core, knebøy, gym, vekter eller «etter løpetur + styrke» i noen description — det hører ikke hjemme i løpesjekklisten. Vil du anbefale styrke ved siden av, gjør det i det vanlige chat-svaret, ikke i verktøyets sessions. Når brukeren har et hovedløp eller oppgitt konkurranse, fyll valgfrie feltene main_race_name og main_race_date (YYYY-MM-DD) i create_running_program slik at appen og du husker datoen. Når main_race_date er satt, skal feltet weeks og alle økters week aldri overskride antall uker frem til konkurransen (programmet skal ikke fortsette etter konkurranseuken). For create_running_program: klassifiser hver planlagte løpeøkt med nøyaktig én workout_type blant de fire som i appen ved manuell løpelogging: «Rolig løpetur», «Terkeløkt», «Intervaller», «Konkurranse». Velg typen ut fra øktens hovedformål (varig rolig grunnlag, terskel/tempo, intervaller, eller konkurranse/test). workout_type blir øktens tittel i sjekklisten; skriv konkrete løpedetaljer kun i description. For korte ukeplaner (noen dager) kan create_workout_plan brukes. Strava-data kan hentes med get_training_summary når det er relevant. Etter et verktøykall: oppsummer resultatet kort og vennlig for brukeren (3–7 punkter ved plan), uten å sitere rå JSON eller interne feltnavn. Vær konkret og basert på treningslære. Bruk norsk, vær varm og motiverende, men hold svarene korte og presise.';
-      const coachSystem = `${baseCoachSystem}${buildCompetitionCoachContext(runningPrograms)}`;
+        'Du er en personlig treningsrådgiver (PRT) for en løper som også driver med styrketrening. Brukeren driver KUN med løping og styrke – ikke triatlon, sykling eller svømming. Ikke foreslå sykkel-, svømme- eller triatlonøkter. Svar på spørsmål om trening, løping, styrke, restitusjon, pulssoner og planlegging. Når brukeren ber om et løpeprogram over flere uker (eller har et tydelig tidsbegrenset mål), kaller du verktøyet create_running_program slik at øktene kan lagres som sjekkliste i appen. Verktøyet create_running_program inneholder bare løpeøkter: for hver økt er workout_type allerede én av «Rolig løpetur», «Terkeløkt», «Intervaller», «Konkurranse», og feltet description skal kun beskrive selve løpeøkta (distanse, varighet, intensitet, puls, drag, terreng). Ikke skriv styrke, core, knebøy, gym, vekter eller «etter løpetur + styrke» i noen description — det hører ikke hjemme i løpesjekklisten. Vil du anbefale styrke ved siden av, gjør det i det vanlige chat-svaret, ikke i verktøyets sessions. Når brukeren i chatten oppgir konkurranse eller dato (f.eks. «10. juni»), skal main_race_date og main_race_name i create_running_program alltid bygge på det brukeren **sier i samtalen nå** — ikke på eldre konkurranser som bare står lagret i listen fra fanen Løpeprogram. Når brukeren har et hovedløp eller oppgitt konkurranse, fyll valgfrie feltene main_race_name og main_race_date (YYYY-MM-DD) i create_running_program slik at appen og du husker datoen. Når main_race_date er satt, skal feltet weeks og alle økters week aldri overskride antall uker frem til konkurransen (programmet skal ikke fortsette etter konkurranseuken). For create_running_program: klassifiser hver planlagte løpeøkt med nøyaktig én workout_type blant de fire som i appen ved manuell løpelogging: «Rolig løpetur», «Terkeløkt», «Intervaller», «Konkurranse». Velg typen ut fra øktens hovedformål (varig rolig grunnlag, terskel/tempo, intervaller, eller konkurranse/test). workout_type blir øktens tittel i sjekklisten; skriv konkrete løpedetaljer kun i description. For korte ukeplaner (noen dager) kan create_workout_plan brukes. Strava-data kan hentes med get_training_summary når det er relevant. Etter et verktøykall: oppsummer resultatet kort og vennlig for brukeren (3–7 punkter ved plan), uten å sitere rå JSON eller interne feltnavn. Vær konkret og basert på treningslære. Bruk norsk, vær varm og motiverende, men hold svarene korte og presise.';
+      const raceFromMessage = extractStatedCompetitionYmdFromText(text);
+      const racePriorityBlock = raceFromMessage
+        ? `\n\nPRIORITET (siste brukermelding): Konkurranse med dato ${raceFromMessage.human} — sett main_race_date=${raceFromMessage.ymd} i create_running_program når du lager program mot dette løpet (og passende main_race_name hvis brukeren nevnte navn). Bruk ikke en annen dato fra listen over lagrede løpeprogram.`
+        : '';
+      const coachSystem = `${baseCoachSystem}${buildCompetitionCoachContext(runningPrograms)}${racePriorityBlock}`;
       const payload = {
         messages: [
           {
@@ -4603,6 +4607,107 @@ function formatNorwegianDate(s: string): string {
   }
 }
 
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+/** Velg år slik at datoen ikke havner i fortiden (lokal kalender). */
+function ymdFromDayMonthWithSmartYear(day: number, month: number): string {
+  const now = new Date();
+  let year = now.getFullYear();
+  const candidate = new Date(year, month - 1, day);
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (candidate < todayStart) year += 1;
+  return `${year}-${pad2(month)}-${pad2(day)}`;
+}
+
+/**
+ * Plukker ut konkurransedato fra brukerens melding (f.eks. «10. juni», ISO, 10.06.2026).
+ * Gir modellen eksplisitt main_race_date så den ikke blander med eldre lagrede programmer.
+ */
+function extractStatedCompetitionYmdFromText(text: string): { ymd: string; human: string } | null {
+  const t = text.trim();
+  if (!t) return null;
+
+  const iso = t.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
+  if (iso) {
+    const y = Number(iso[1]);
+    const mo = Number(iso[2]);
+    const d = Number(iso[3]);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      const ymd = `${y}-${iso[2]}-${iso[3]}`;
+      return { ymd, human: formatNorwegianDate(ymd) };
+    }
+  }
+
+  const dmy = t.match(/\b(\d{1,2})\.(\d{1,2})\.(20\d{2})\b/);
+  if (dmy) {
+    const d = Number(dmy[1]);
+    const mo = Number(dmy[2]);
+    const y = Number(dmy[3]);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      const ymd = `${y}-${pad2(mo)}-${pad2(d)}`;
+      return { ymd, human: formatNorwegianDate(ymd) };
+    }
+  }
+
+  const monthNameToNum: Record<string, number> = {
+    januar: 1,
+    jan: 1,
+    februar: 2,
+    feb: 2,
+    mars: 3,
+    mar: 3,
+    april: 4,
+    apr: 4,
+    mai: 5,
+    juni: 6,
+    jun: 6,
+    juli: 7,
+    jul: 7,
+    august: 8,
+    aug: 8,
+    september: 9,
+    sep: 9,
+    sept: 9,
+    oktober: 10,
+    okt: 10,
+    november: 11,
+    nov: 11,
+    desember: 12,
+    des: 12,
+  };
+
+  type Cand = { ymd: string; human: string; score: number; idx: number };
+  const cands: Cand[] = [];
+  const re = /\b(\d{1,2})\.?\s*([a-zA-ZæøåÆØÅ]+)\b/g;
+  const lower = t.toLowerCase();
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(t)) != null) {
+    const day = Number(m[1]);
+    const monStr = m[2].toLowerCase().replace(/\.$/, '');
+    const month = monthNameToNum[monStr];
+    if (!month || day < 1 || day > 31) continue;
+    const idx = m.index;
+    const win = lower.slice(Math.max(0, idx - 140), Math.min(lower.length, idx + 60));
+    const score = /\bkonkurranse|hovedløp|løpet|løp\s+på|måløp|race|10\s*km|5\s*km|halvmaraton|maraton|oppløp|nm\b/i.test(
+      win,
+    )
+      ? 80
+      : 15;
+    const ymd = ymdFromDayMonthWithSmartYear(day, month);
+    cands.push({ ymd, human: formatNorwegianDate(ymd), score, idx });
+  }
+  if (cands.length === 0) return null;
+  cands.sort((a, b) => b.score - a.score || b.idx - a.idx);
+  const top = cands[0]!;
+  if (top.score < 80 && cands.every((c) => c.score < 80)) {
+    const withRaceWord = /\bkonkurranse|hovedløp|måløp|halvmaraton|maraton|race\b/i.test(t);
+    if (!withRaceWord) return null;
+  }
+  return { ymd: top.ymd, human: top.human };
+}
+
 function buildCompetitionCoachContext(programs: SavedRunningProgram[]): string {
   const lines: string[] = [];
   for (const p of programs) {
@@ -4617,9 +4722,9 @@ function buildCompetitionCoachContext(programs: SavedRunningProgram[]): string {
   }
   if (lines.length === 0) return '';
   return (
-    '\n\nBrukerens registrerte konkurranse(r) i løpeprogram:\n' +
+    '\n\nKun som referanse — allerede lagret under fanen Løpeprogram (kan være et annet løp enn det brukeren nettopp skriver om i chat):\n' +
     lines.join('\n') +
-    '\nTa hensyn til dato og navn når du planlegger og følger opp. Unngå å gjenta samme oppfølgingsspørsmål samme dag hvis det allerede er sendt en egen melding om konkurransen.'
+    '\nBruk **ikke** disse datoene i create_running_program når brukeren i samme samtale har sagt en ny konkurranse eller dato — da gjelder det brukeren sier nå. Ta hensyn til dato og navn ved oppfølging. Unngå å gjenta samme oppfølgingsspørsmål samme dag hvis det allerede er sendt en egen melding om konkurransen.'
   );
 }
 

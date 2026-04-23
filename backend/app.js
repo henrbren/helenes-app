@@ -531,7 +531,7 @@ function getTools() {
       function: {
         name: 'create_running_program',
         description:
-          'Lag et strukturert løpeprogram med én rad per planlagt økt. Kun løpeøkter i sessions — hver rad er én løpeøkt med workout_type som tittel. Ikke legg styrke, core, gym eller «etter løpetur: styrke» inn i noen økts description; det tilhører ikke løpesjekklisten. Eventuell styrkeanbefaling kan du skrive i det vanlige chat-svaret, ikke i verktøydata. Fyll sessions sortert etter uke (uke 1 først). Detaljer (varighet, distanse, intensitet, puls, struktur) kun i description. Viktig: når main_race_date er satt, skal weeks aldri være større enn antall uker fra i dag til konkurransen (ca. ceil(dager/7) fra nåværende dato i Norge); programmet skal ikke fortsette etter konkurranseuken.',
+          'Lag et strukturert løpeprogram med én rad per planlagt økt. Kun løpeøkter i sessions — hver rad er én løpeøkt med workout_type som tittel. Ikke legg styrke, core, gym eller «etter løpetur: styrke» inn i noen økts description; det tilhører ikke løpesjekklisten. Eventuell styrkeanbefaling kan du skrive i det vanlige chat-svaret, ikke i verktøydata. Fyll sessions sortert etter uke (uke 1 først). Detaljer (varighet, distanse, intensitet, puls, struktur) kun i description. Når brukeren nettopp har oppgitt konkurranse/dato i chat, skal main_race_date følge det — ikke en eldre dato fra lagrede programmer i systemkontekst. Viktig: når main_race_date er satt, skal weeks aldri være større enn antall uker fra i dag til konkurransen (ca. ceil(dager/7) fra nåværende dato i Norge); programmet skal ikke fortsette etter konkurranseuken.',
         parameters: {
           type: 'object',
           additionalProperties: false,
