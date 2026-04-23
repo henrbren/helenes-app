@@ -1,30 +1,32 @@
-import fs from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { kvDel, kvGetJson, kvSetJson } from './lib/kv.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-/** På Vercel er prosjektmappa skrivebeskyttet; bruk /tmp (eller sett TRAINING_LOG_DATA_DIR). */
-function getBackendDataDir() {
-  const override = process.env.TRAINING_LOG_DATA_DIR?.trim();
-  if (override) return override;
-  if (process.env.VERCEL) return path.join(os.tmpdir(), 'training-log-backend');
-  return __dirname;
-}
-
-const BACKEND_DATA_DIR = getBackendDataDir();
-const TOKEN_CACHE_PATH = path.join(BACKEND_DATA_DIR, '.strava-tokens.json');
-const BEST_EFFORTS_CACHE_PATH = path.join(BACKEND_DATA_DIR, '.strava-best-efforts.json');
-
-async function ensureDataDir() {
-  await fs.mkdir(BACKEND_DATA_DIR, { recursive: true });
-}
+/**
+ * Strava-klient. Fra og med auth-omleggingen er ALLE funksjoner per-bruker:
+ * tokens og best-efforts-cache lagres i KV på formen
+ *   user:<userId>:strava-tokens
+ *   user:<userId>:strava-best-efforts
+ * og kalles alltid med userId som første argument. Det gamle fil-/tmp-baserte
+ * lageret er fjernet – /tmp er efemert på Vercel og delte tokens per
+ * instans var kilde til mange av de gamle feilene.
+ */
 
 const STRAVA_OAUTH_URL = 'https://www.strava.com/oauth/token';
 const STRAVA_AUTHORIZE_URL = 'https://www.strava.com/oauth/authorize';
 const STRAVA_API_BASE = 'https://www.strava.com/api/v3';
 export const DEFAULT_SCOPE = 'read,activity:read_all,profile:read_all';
+
+// Fornye litt før faktisk expiry så vi ikke racer klokken.
+const REFRESH_LEEWAY_SECONDS = 120;
+
+function tokensKey(userId) {
+  if (!userId) throw new Error('Strava: userId er påkrevd');
+  return `user:${userId}:strava-tokens`;
+}
+
+function bestEffortsKey(userId) {
+  if (!userId) throw new Error('Strava: userId er påkrevd');
+  return `user:${userId}:strava-best-efforts`;
+}
 
 /** Først standard STRAVA_*, så f.eks. Vercel-camelCase (stravaClientId, …). */
 function stravaEnv(...keys) {
@@ -34,113 +36,111 @@ function stravaEnv(...keys) {
   }
   return undefined;
 }
-// Refresh a little before actual expiry so we don't race the clock.
-const REFRESH_LEEWAY_SECONDS = 120;
-
-let tokenState = null;
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
 }
 
-async function readCachedTokens() {
-  try {
-    const raw = await fs.readFile(TOKEN_CACHE_PATH, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.access_token === 'string' && typeof parsed.refresh_token === 'string') {
-      return parsed;
-    }
-  } catch {
-    // No cache yet; that's fine.
+async function readTokens(userId) {
+  const data = await kvGetJson(tokensKey(userId));
+  if (!data || typeof data.access_token !== 'string' || typeof data.refresh_token !== 'string') {
+    return null;
   }
-  return null;
+  return data;
 }
 
-async function persistTokens(tokens) {
-  try {
-    await ensureDataDir();
-    await fs.writeFile(TOKEN_CACHE_PATH, JSON.stringify(tokens, null, 2), 'utf8');
-  } catch (err) {
-    console.warn('[strava] could not persist refreshed tokens:', err?.message || err);
-  }
+async function writeTokens(userId, tokens) {
+  await kvSetJson(tokensKey(userId), tokens);
 }
 
-async function loadInitialState() {
-  if (tokenState) return tokenState;
-
-  const cached = await readCachedTokens();
-  if (cached) {
-    tokenState = cached;
-    return tokenState;
-  }
-
-  const accessToken = stravaEnv('STRAVA_ACCESS_TOKEN', 'stravaAccessToken');
-  const refreshToken = stravaEnv('STRAVA_REFRESH_TOKEN', 'stravaUpdateToken');
-  const expiresAt = Number(stravaEnv('STRAVA_EXPIRES_AT', 'stravaExpiresAt') || 0);
-
-  if (!accessToken || !refreshToken) {
-    throw new Error(
-      'Missing Strava credentials. Set STRAVA_ACCESS_TOKEN and STRAVA_REFRESH_TOKEN in backend/.env'
-    );
-  }
-
-  tokenState = {
-    access_token: accessToken,
-    refresh_token: refreshToken,
-    expires_at: Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : 0,
-  };
-  return tokenState;
+/** Slett Strava-tokens for en bruker (brukes ved unlink). */
+export async function clearStravaTokens(userId) {
+  await kvDel(tokensKey(userId));
 }
 
-async function refreshAccessToken() {
+/**
+ * Promise-lock per bruker for refresh. Strava roterer refresh_token ved hver
+ * refresh; parallelle refresh-forsøk ville kollidert og invalidere token-paret.
+ */
+const refreshLocks = new Map();
+
+async function refreshAccessToken(userId) {
+  const existing = refreshLocks.get(userId);
+  if (existing) return existing;
+
   const clientId = stravaEnv('STRAVA_CLIENT_ID', 'stravaClientId');
   const clientSecret = stravaEnv('STRAVA_CLIENT_SECRET', 'stravaClientSecret');
   if (!clientId || !clientSecret) {
-    throw new Error('Missing STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET in backend/.env');
+    throw new Error('Mangler STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET');
   }
 
-  const state = await loadInitialState();
-  const body = new URLSearchParams({
-    client_id: clientId,
-    client_secret: clientSecret,
-    grant_type: 'refresh_token',
-    refresh_token: state.refresh_token,
+  const promise = (async () => {
+    const state = await readTokens(userId);
+    if (!state) {
+      const err = new Error('Strava er ikke koblet til for denne brukeren.');
+      err.code = 'STRAVA_NOT_CONNECTED';
+      err.status = 401;
+      throw err;
+    }
+    const body = new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      grant_type: 'refresh_token',
+      refresh_token: state.refresh_token,
+    });
+    const resp = await fetch(STRAVA_OAUTH_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      const err = new Error(`Strava token refresh failed (${resp.status}): ${text}`);
+      err.status = resp.status;
+      throw err;
+    }
+    const data = await resp.json();
+    const prevScope = state.granted_scope;
+    const next = {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at: data.expires_at,
+      granted_scope: prevScope ?? null,
+    };
+    await writeTokens(userId, next);
+    return next;
+  })().finally(() => {
+    refreshLocks.delete(userId);
   });
 
-  const resp = await fetch(STRAVA_OAUTH_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    throw new Error(`Strava token refresh failed (${resp.status}): ${text}`);
-  }
-
-  const data = await resp.json();
-  const prevScope = state.granted_scope;
-  tokenState = {
-    access_token: data.access_token,
-    refresh_token: data.refresh_token,
-    expires_at: data.expires_at,
-    granted_scope: prevScope ?? null,
-  };
-  await persistTokens(tokenState);
-  return tokenState;
+  refreshLocks.set(userId, promise);
+  return promise;
 }
 
-async function getValidAccessToken() {
-  const state = await loadInitialState();
+async function getValidAccessToken(userId) {
+  const state = await readTokens(userId);
+  if (!state) {
+    const err = new Error('Strava er ikke koblet til for denne brukeren.');
+    err.code = 'STRAVA_NOT_CONNECTED';
+    err.status = 401;
+    throw err;
+  }
   if (!state.expires_at || state.expires_at - REFRESH_LEEWAY_SECONDS <= nowSeconds()) {
-    const refreshed = await refreshAccessToken();
+    const refreshed = await refreshAccessToken(userId);
     return refreshed.access_token;
   }
   return state.access_token;
 }
 
-async function stravaGet(pathname, query) {
-  const token = await getValidAccessToken();
+/** Sjekker om en bruker har koblet til Strava. */
+export async function hasStravaConnection(userId) {
+  if (!userId) return false;
+  const tokens = await readTokens(userId);
+  return Boolean(tokens);
+}
+
+async function stravaGet(userId, pathname, query) {
+  const token = await getValidAccessToken(userId);
   const url = new URL(`${STRAVA_API_BASE}${pathname}`);
   if (query) {
     for (const [k, v] of Object.entries(query)) {
@@ -151,9 +151,9 @@ async function stravaGet(pathname, query) {
 
   let resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
 
-  // Token might have been invalidated server-side (e.g. revoked); try one refresh.
+  // Token kan ha blitt invalidert serverside (f.eks. revoked); prøv én refresh.
   if (resp.status === 401) {
-    const refreshed = await refreshAccessToken();
+    const refreshed = await refreshAccessToken(userId);
     resp = await fetch(url, { headers: { Authorization: `Bearer ${refreshed.access_token}` } });
   }
 
@@ -166,15 +166,16 @@ async function stravaGet(pathname, query) {
   return resp.json();
 }
 
-export function buildAuthorizeUrl({ redirectUri, scope = DEFAULT_SCOPE }) {
+export function buildAuthorizeUrl({ redirectUri, scope = DEFAULT_SCOPE, state }) {
   const clientId = stravaEnv('STRAVA_CLIENT_ID', 'stravaClientId');
-  if (!clientId) throw new Error('Missing STRAVA_CLIENT_ID');
+  if (!clientId) throw new Error('Mangler STRAVA_CLIENT_ID');
   const url = new URL(STRAVA_AUTHORIZE_URL);
   url.searchParams.set('client_id', clientId);
   url.searchParams.set('response_type', 'code');
   url.searchParams.set('redirect_uri', redirectUri);
   url.searchParams.set('approval_prompt', 'force');
   url.searchParams.set('scope', scope);
+  if (state) url.searchParams.set('state', state);
   return url.toString();
 }
 
@@ -189,14 +190,20 @@ export function hasActivityListScope(scopeString) {
   return parts.includes('activity:read_all') || parts.includes('activity:read');
 }
 
+/**
+ * Bytter en autorisasjonskode mot tokens. Returnerer både tokens OG rå athlete-
+ * respons, slik at auth-laget kan lage/koble til en bruker uten et ekstra API-
+ * kall. For login-flyten (uten kjent userId) lagres IKKE tokens her – kallende
+ * kode må selv bestemme hvor de skal høre hjemme.
+ */
 export async function exchangeCodeForTokens(code, redirectUri, grantedScope = '') {
   const clientId = stravaEnv('STRAVA_CLIENT_ID', 'stravaClientId');
   const clientSecret = stravaEnv('STRAVA_CLIENT_SECRET', 'stravaClientSecret');
   if (!clientId || !clientSecret) {
-    throw new Error('Missing STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET');
+    throw new Error('Mangler STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET');
   }
   if (!redirectUri || typeof redirectUri !== 'string') {
-    throw new Error('redirectUri is required and must match the authorize request exactly');
+    throw new Error('redirectUri er påkrevd og må matche authorize-kallet.');
   }
 
   const body = new URLSearchParams({
@@ -220,37 +227,43 @@ export async function exchangeCodeForTokens(code, redirectUri, grantedScope = ''
 
   const data = await resp.json();
   const scopeToStore = (typeof grantedScope === 'string' && grantedScope.trim()) || data.scope || null;
-  tokenState = {
+  const tokens = {
     access_token: data.access_token,
     refresh_token: data.refresh_token,
     expires_at: data.expires_at,
     granted_scope: scopeToStore,
   };
-  await persistTokens(tokenState);
-  return { tokens: tokenState, athlete: data.athlete, scope: data.scope };
+  return { tokens, athlete: data.athlete, scope: data.scope };
 }
 
-export async function getAthlete() {
-  return stravaGet('/athlete');
+/** Lagre tokens fra exchangeCodeForTokens på en spesifikk bruker. */
+export async function saveStravaTokensForUser(userId, tokens) {
+  if (!userId) throw new Error('saveStravaTokensForUser: userId er påkrevd');
+  await writeTokens(userId, tokens);
 }
 
-export async function getActivities({ perPage = 10, page = 1, after, before } = {}) {
-  return stravaGet('/athlete/activities', { per_page: perPage, page, after, before });
+export async function getAthlete(userId) {
+  return stravaGet(userId, '/athlete');
 }
 
-export async function getAthleteStats(athleteId) {
-  return stravaGet(`/athletes/${athleteId}/stats`);
+export async function getActivities(userId, { perPage = 10, page = 1, after, before } = {}) {
+  return stravaGet(userId, '/athlete/activities', { per_page: perPage, page, after, before });
 }
 
-export async function getActivity(id) {
-  return stravaGet(`/activities/${id}`);
+export async function getAthleteStats(userId, athleteId) {
+  return stravaGet(userId, `/athletes/${athleteId}/stats`);
+}
+
+export async function getActivity(userId, id) {
+  return stravaGet(userId, `/activities/${id}`);
 }
 
 export async function getActivityStreams(
+  userId,
   id,
-  keys = ['heartrate', 'velocity_smooth', 'time', 'distance', 'altitude', 'cadence']
+  keys = ['heartrate', 'velocity_smooth', 'time', 'distance', 'altitude', 'cadence'],
 ) {
-  return stravaGet(`/activities/${id}/streams`, {
+  return stravaGet(userId, `/activities/${id}/streams`, {
     keys: keys.join(','),
     key_by_type: true,
   });
@@ -259,12 +272,11 @@ export async function getActivityStreams(
 /**
  * Convenience: pull recent activities and shape them for the app/chat.
  */
-export async function getRecentActivitiesSummary({ days = 7, perPage = 30 } = {}) {
+export async function getRecentActivitiesSummary(userId, { days = 7, perPage = 30 } = {}) {
   const after = Math.floor(Date.now() / 1000) - days * 24 * 60 * 60;
-  const raw = await getActivities({ perPage, after });
-  // Strava returns ascending order when `after` is set; we want newest first.
+  const raw = await getActivities(userId, { perPage, after });
   const activities = [...raw].sort(
-    (a, b) => new Date(b.start_date).getTime() - new Date(a.start_date).getTime()
+    (a, b) => new Date(b.start_date).getTime() - new Date(a.start_date).getTime(),
   );
 
   const totals = activities.reduce(
@@ -275,7 +287,7 @@ export async function getRecentActivitiesSummary({ days = 7, perPage = 30 } = {}
       acc.elevationMeters += a.total_elevation_gain || 0;
       return acc;
     },
-    { count: 0, distanceMeters: 0, movingSeconds: 0, elevationMeters: 0 }
+    { count: 0, distanceMeters: 0, movingSeconds: 0, elevationMeters: 0 },
   );
 
   return {
@@ -311,10 +323,6 @@ export function formatPace(secPerKm) {
 
 const RUN_SPORT_TYPES = new Set(['Run', 'TrailRun', 'VirtualRun']);
 
-/**
- * Strava's built-in "best effort" distance names, in ascending order.
- * We use this list to sort results and to filter out any non-standard entries.
- */
 const STANDARD_RUN_EFFORT_ORDER = [
   '400m',
   '1/2 mile',
@@ -331,36 +339,22 @@ const STANDARD_RUN_EFFORT_ORDER = [
   'Marathon',
 ];
 
-async function loadBestEffortsDiskCache() {
-  try {
-    const raw = await fs.readFile(BEST_EFFORTS_CACHE_PATH, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') {
-      const scannedIds = Array.isArray(parsed.scannedIds)
-        ? parsed.scannedIds.map(String).filter(Boolean)
-        : [];
-      const bestByName =
-        parsed.bestByName && typeof parsed.bestByName === 'object' ? parsed.bestByName : {};
-      return {
-        scannedIds,
-        bestByName,
-        lastScanAt: Number(parsed.lastScanAt) || 0,
-        totalRuns: Number(parsed.totalRuns) || 0,
-      };
-    }
-  } catch {
-    // no cache yet
+async function loadBestEffortsCache(userId) {
+  const parsed = await kvGetJson(bestEffortsKey(userId));
+  if (!parsed || typeof parsed !== 'object') {
+    return { scannedIds: [], bestByName: {}, lastScanAt: 0, totalRuns: 0, rateLimitedAt: 0 };
   }
-  return { scannedIds: [], bestByName: {}, lastScanAt: 0, totalRuns: 0 };
+  return {
+    scannedIds: Array.isArray(parsed.scannedIds) ? parsed.scannedIds.map(String).filter(Boolean) : [],
+    bestByName: parsed.bestByName && typeof parsed.bestByName === 'object' ? parsed.bestByName : {},
+    lastScanAt: Number(parsed.lastScanAt) || 0,
+    totalRuns: Number(parsed.totalRuns) || 0,
+    rateLimitedAt: Number(parsed.rateLimitedAt) || 0,
+  };
 }
 
-async function persistBestEffortsDiskCache(data) {
-  try {
-    await ensureDataDir();
-    await fs.writeFile(BEST_EFFORTS_CACHE_PATH, JSON.stringify(data, null, 2), 'utf8');
-  } catch (err) {
-    console.warn('[strava] could not persist best efforts cache:', err?.message || err);
-  }
+async function persistBestEffortsCache(userId, data) {
+  await kvSetJson(bestEffortsKey(userId), data);
 }
 
 function sortedEffortList(bestByName) {
@@ -373,52 +367,46 @@ function sortedEffortList(bestByName) {
   });
 }
 
-export async function readBestEffortsSnapshot() {
-  const cache = await loadBestEffortsDiskCache();
+export async function readBestEffortsSnapshot(userId) {
+  const cache = await loadBestEffortsCache(userId);
   const bestByName = new Map(Object.entries(cache.bestByName));
+  // Vi regner en rate-limit som "fersk" i 15 min – Strava-vinduet.
+  const rateLimited = cache.rateLimitedAt
+    ? Date.now() - cache.rateLimitedAt < 15 * 60 * 1000
+    : false;
   return {
     scannedRuns: cache.scannedIds.length,
     totalRuns: cache.totalRuns,
     pendingRuns: Math.max(0, cache.totalRuns - cache.scannedIds.length),
     lastScanAt: cache.lastScanAt,
-    rateLimited: false,
+    rateLimited,
     efforts: sortedEffortList(bestByName),
   };
 }
 
-export async function resetBestEffortsCache() {
-  try {
-    await fs.unlink(BEST_EFFORTS_CACHE_PATH);
-  } catch {
-    // ignore if it doesn't exist
-  }
+export async function resetBestEffortsCache(userId) {
+  await kvDel(bestEffortsKey(userId));
 }
 
 /**
  * Scan running activities and accumulate the fastest recorded `best_effort`
- * per standard distance across the entire Strava history.
+ * per standard distance across the entire Strava history for a given user.
  *
- * Because `/activities/{id}` costs one API call per run and Strava's rate
- * limit is 100 req / 15 min, each call only scans up to `batch` new
- * (previously un-scanned) runs. Results are persisted to disk and merged
- * with previous scans so calling this repeatedly eventually covers the
- * whole history and the returned `efforts` are true all-time bests.
- *
- * If `reset` is true, the on-disk cache is cleared first.
+ * Each call scans up to `batch` new (previously un-scanned) runs. Results are
+ * persisted to KV and merged with previous scans so calling this repeatedly
+ * eventually covers the whole history.
  */
-export async function getRunningBestEfforts({ batch = 25, reset = false } = {}) {
+export async function getRunningBestEfforts(userId, { batch = 25, reset = false } = {}) {
   const safeBatch = Math.min(Math.max(Number(batch) || 25, 1), 200);
 
   if (reset) {
-    await resetBestEffortsCache();
+    await resetBestEffortsCache(userId);
   }
 
-  const diskCache = await loadBestEffortsDiskCache();
+  const diskCache = await loadBestEffortsCache(userId);
   const scannedSet = new Set(diskCache.scannedIds.map(String));
   const bestByName = new Map(Object.entries(diskCache.bestByName));
 
-  // Fetch all run summaries (cheap: 100 per page). This lets us know the
-  // total number of runs and identify which ones still need detailed scanning.
   const allRuns = [];
   let page = 1;
   const perPage = 100;
@@ -427,7 +415,7 @@ export async function getRunningBestEfforts({ batch = 25, reset = false } = {}) 
   while (true) {
     let pageResp;
     try {
-      pageResp = await getActivities({ perPage, page });
+      pageResp = await getActivities(userId, { perPage, page });
     } catch (err) {
       if (err?.status === 429) {
         rateLimited = true;
@@ -446,9 +434,8 @@ export async function getRunningBestEfforts({ batch = 25, reset = false } = {}) 
     page += 1;
   }
 
-  // Newest first so the first few scans quickly surface recent PRs.
   const sortedRuns = [...allRuns].sort(
-    (a, b) => new Date(b.start_date).getTime() - new Date(a.start_date).getTime()
+    (a, b) => new Date(b.start_date).getTime() - new Date(a.start_date).getTime(),
   );
   const unscanned = sortedRuns.filter((a) => !scannedSet.has(String(a.id)));
 
@@ -458,7 +445,7 @@ export async function getRunningBestEfforts({ batch = 25, reset = false } = {}) 
     if (rateLimited) break;
     let detail;
     try {
-      detail = await getActivity(a.id);
+      detail = await getActivity(userId, a.id);
     } catch (err) {
       if (err?.status === 429) {
         rateLimited = true;
@@ -495,8 +482,9 @@ export async function getRunningBestEfforts({ batch = 25, reset = false } = {}) 
     bestByName: Object.fromEntries(bestByName),
     lastScanAt: Date.now(),
     totalRuns,
+    rateLimitedAt: rateLimited ? Date.now() : 0,
   };
-  await persistBestEffortsDiskCache(updatedCache);
+  await persistBestEffortsCache(userId, updatedCache);
 
   return {
     scannedRuns: scannedSet.size,

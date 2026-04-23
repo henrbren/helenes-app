@@ -3,6 +3,19 @@ import 'dotenv/config';
 import express from 'express';
 import OpenAI from 'openai';
 import { z } from 'zod';
+import { createAuthRouter } from './lib/auth-routes.js';
+import { consumeOAuthState, createOAuthState } from './lib/oauth-state.js';
+import {
+  buildSessionCookie,
+  createSession,
+  requireAuth,
+} from './lib/sessions.js';
+import {
+  createUserFromStrava,
+  findUserByStravaAthlete,
+  linkStravaToUser,
+  publicUser,
+} from './lib/users.js';
 import {
   buildAuthorizeUrl,
   exchangeCodeForTokens,
@@ -14,8 +27,10 @@ import {
   getRecentActivitiesSummary,
   getRunningBestEfforts,
   hasActivityListScope,
+  hasStravaConnection,
   readBestEffortsSnapshot,
   resetBestEffortsCache,
+  saveStravaTokensForUser,
 } from './strava.js';
 
 const PORT = Number(process.env.PORT || 8787);
@@ -62,7 +77,7 @@ app.use((req, _res, next) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// ---- Strava routes ---------------------------------------------------------
+// ---- Strava helpers --------------------------------------------------------
 /** På Vercel/serverless er req.protocol ofte "http" uten forwarded headers; Strava krever https + eksakt matchende host. */
 function selfBaseUrl(req) {
   const forwardedProto = (req.get('x-forwarded-proto') || '').split(',')[0].trim();
@@ -80,25 +95,56 @@ function selfBaseUrl(req) {
   return `${proto}://${host}`;
 }
 
-/** Must be identical for /authorize and /token. Strava validates against «Authorization Callback Domain». */
+/** Må være identisk for /authorize og /token. Strava validerer mot «Authorization Callback Domain». */
 function stravaRedirectUri(req) {
   const fixed = process.env.STRAVA_REDIRECT_URI?.trim();
   if (fixed) return fixed;
   return `${selfBaseUrl(req)}/strava/callback`;
 }
 
-app.get('/strava/connect', (req, res) => {
+// ---- Auth routes -----------------------------------------------------------
+app.use(createAuthRouter({ stravaRedirectUri }));
+
+// ---- Strava connect (krever innlogget bruker) ------------------------------
+app.get('/strava/connect', requireAuth, async (req, res) => {
   try {
     const redirectUri = stravaRedirectUri(req);
-    const url = buildAuthorizeUrl({ redirectUri });
+    const state = await createOAuthState({
+      intent: 'connect',
+      userId: req.user.id,
+      redirectUri,
+    });
+    const url = buildAuthorizeUrl({ redirectUri, state });
     res.redirect(url);
   } catch (err) {
-    res.status(500).json({ error: err?.message || 'Could not build authorize url' });
+    res.status(500).json({ error: err?.message || 'Kunne ikke bygge authorize-url.' });
   }
 });
 
+/**
+ * Hjelper for å generere HTML-siden som vises brukeren etter callback. På web
+ * sender vi dem tilbake til app-frontenden med query-parametere som App.tsx
+ * leser og rensker bort. For login-flyten inkluderer vi sessionToken i URL-en
+ * fordi dette er en tvers-av-origin redirect og vi ikke kan stole på at
+ * httpOnly-cookien er satt for frontenden (kan f.eks. være native-app som
+ * åpner via Linking).
+ */
+function successRedirectHtml({ webBase, queryParams, message }) {
+  const qs = new URLSearchParams(queryParams).toString();
+  const href = `${webBase || '/'}${qs ? `?${qs}` : ''}`;
+  const safeHref = href.replace(/"/g, '&quot;');
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Strava</title>
+<meta http-equiv="refresh" content="1;url=${safeHref}">
+<style>body{font-family:-apple-system,Segoe UI,Inter,Arial,sans-serif;max-width:560px;margin:60px auto;padding:0 20px;color:#0f172a}
+h1{font-size:22px;margin-bottom:8px}p{line-height:1.5}code{background:#f1f5f9;padding:2px 6px;border-radius:6px}
+a.btn{display:inline-block;margin-top:12px;padding:10px 16px;background:#7A3C4A;color:#fff;border-radius:10px;text-decoration:none}</style></head>
+<body><h1>${message}</h1>
+<p>Du blir sendt tilbake til appen automatisk. Hvis ingenting skjer:</p>
+<p><a class="btn" href="${safeHref}">Tilbake til appen</a></p></body></html>`;
+}
+
 app.get('/strava/callback', async (req, res) => {
-  const { code, error, scope } = req.query;
+  const { code, error, scope, state } = req.query;
   if (error) {
     res.status(400).send(`Strava authorization failed: ${error}`);
     return;
@@ -107,9 +153,19 @@ app.get('/strava/callback', async (req, res) => {
     res.status(400).send('Missing ?code from Strava');
     return;
   }
+  if (!state || typeof state !== 'string') {
+    res.status(400).send('Missing state. Start OAuth-flyten på nytt fra appen.');
+    return;
+  }
+
+  const statePayload = await consumeOAuthState(state);
+  if (!statePayload) {
+    res.status(400).send('OAuth state er ugyldig eller utløpt. Start på nytt fra appen.');
+    return;
+  }
 
   try {
-    const redirectUri = stravaRedirectUri(req);
+    const redirectUri = statePayload.redirectUri || stravaRedirectUri(req);
     const scopeAccepted = typeof scope === 'string' ? scope : '';
     const actOk = hasActivityListScope(scopeAccepted);
     if (actOk === false) {
@@ -119,57 +175,111 @@ app.get('/strava/callback', async (req, res) => {
 <body><h1>Mangler tilgang til aktiviteter</h1>
 <p>Strava rapporterer at du <strong>ikke</strong> godkjente lesetilgang til treningsøkter (scope mangler <code>activity:read</code> eller <code>activity:read_all</code>).</p>
 <p>Du godkjente: <code>${scopeAccepted || '(ingen oppgitt)'}</code></p>
-<p>Gå tilbake til appen → <strong>Innstillinger → Strava</strong> → koble til igjen. På Strava-siden: la <strong>alle</strong> forespurte tilganger være på (ikke fjern kryss for aktiviteter).</p>
+<p>Gå tilbake til appen og koble til på nytt. På Strava-siden: la <strong>alle</strong> forespurte tilganger være på (ikke fjern kryss for aktiviteter).</p>
 <p><a href="https://www.strava.com/settings/apps">Åpne Strava → Mine apper</a> og fjern appen hvis den henger, deretter prøv på nytt.</p></body></html>`);
       return;
     }
-    const result = await exchangeCodeForTokens(code, redirectUri, scopeAccepted);
+
+    const { tokens, athlete } = await exchangeCodeForTokens(code, redirectUri, scopeAccepted);
+    const athleteId = athlete?.id ? String(athlete.id) : null;
+    const athleteName = [athlete?.firstname, athlete?.lastname].filter(Boolean).join(' ').trim() || null;
+
     res.set('Content-Type', 'text/html; charset=utf-8');
-    res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Strava connected</title>
-<style>body{font-family:-apple-system,Segoe UI,Inter,Arial,sans-serif;max-width:560px;margin:60px auto;padding:0 20px;color:#0f172a}
-h1{font-size:22px;margin-bottom:8px}p{line-height:1.5}code{background:#f1f5f9;padding:2px 6px;border-radius:6px}</style></head>
-<body><h1>✅ Strava er koblet til</h1>
-<p>Hei ${result.athlete?.firstname ?? ''}! Tokenet er lagret på serveren med scope <code>${scope || result.scope || ''}</code>.</p>
-<p>Du kan lukke dette vinduet og gå tilbake til appen.</p></body></html>`);
+
+    if (statePayload.intent === 'login') {
+      // Finn eksisterende konto eller opprett ny basert på Strava athleteId.
+      if (!athleteId) {
+        res.status(500).send('Strava returnerte ingen athlete-id. Prøv igjen.');
+        return;
+      }
+      let user = await findUserByStravaAthlete(athleteId);
+      if (!user) {
+        user = await createUserFromStrava({ athleteId, athleteName });
+      } else if (athleteName && user.stravaAthleteName !== athleteName) {
+        user = await linkStravaToUser(user.id, { athleteId, athleteName });
+      }
+      await saveStravaTokensForUser(user.id, tokens);
+      const { token: sessionToken } = await createSession(user.id);
+      res.setHeader('Set-Cookie', buildSessionCookie(sessionToken));
+      res.send(
+        successRedirectHtml({
+          webBase: '/',
+          queryParams: { auth: 'ok', token: sessionToken, strava: 'connected' },
+          message: `Velkommen${athlete?.firstname ? ', ' + athlete.firstname : ''}!`,
+        }),
+      );
+      return;
+    }
+
+    if (statePayload.intent === 'connect') {
+      if (!statePayload.userId) {
+        res.status(400).send('Ugyldig state: mangler bruker.');
+        return;
+      }
+      await saveStravaTokensForUser(statePayload.userId, tokens);
+      if (athleteId) {
+        await linkStravaToUser(statePayload.userId, { athleteId, athleteName });
+      }
+      res.send(
+        successRedirectHtml({
+          webBase: '/',
+          queryParams: { strava: 'connected' },
+          message: 'Strava er koblet til kontoen din',
+        }),
+      );
+      return;
+    }
+
+    res.status(400).send('Ukjent OAuth-intent.');
   } catch (err) {
     res.status(500).send(`Token exchange failed: ${err?.message || err}`);
   }
 });
 
-app.get('/strava/athlete', async (_req, res) => {
+// ---- Strava data routes (per-user, Bearer required) ------------------------
+app.get('/strava/status', requireAuth, async (req, res) => {
   try {
-    const athlete = await getAthlete();
-    res.json(athlete);
+    const connected = await hasStravaConnection(req.user.id);
+    res.json({ connected, user: req.publicUser });
   } catch (err) {
-    res.status(err?.status || 500).json({ error: err?.message || 'Strava error' });
+    res.status(500).json({ error: err?.message || 'Strava status error' });
   }
 });
 
-app.get('/strava/activities', async (req, res) => {
+app.get('/strava/athlete', requireAuth, async (req, res) => {
+  try {
+    const athlete = await getAthlete(req.user.id);
+    res.json(athlete);
+  } catch (err) {
+    res.status(err?.status || 500).json({ error: err?.message || 'Strava error', code: err?.code });
+  }
+});
+
+app.get('/strava/activities', requireAuth, async (req, res) => {
   try {
     const perPage = Math.min(Number(req.query.per_page) || 10, 100);
     const page = Number(req.query.page) || 1;
     const after = req.query.after ? Number(req.query.after) : undefined;
     const before = req.query.before ? Number(req.query.before) : undefined;
-    const activities = await getActivities({ perPage, page, after, before });
+    const activities = await getActivities(req.user.id, { perPage, page, after, before });
     res.json(activities);
   } catch (err) {
-    res.status(err?.status || 500).json({ error: err?.message || 'Strava error' });
+    res.status(err?.status || 500).json({ error: err?.message || 'Strava error', code: err?.code });
   }
 });
 
-app.get('/strava/recent', async (req, res) => {
+app.get('/strava/recent', requireAuth, async (req, res) => {
   try {
     const days = Math.min(Math.max(Number(req.query.days) || 14, 1), 90);
     const perPage = Math.min(Number(req.query.per_page) || 30, 100);
-    const summary = await getRecentActivitiesSummary({ days, perPage });
+    const summary = await getRecentActivitiesSummary(req.user.id, { days, perPage });
     res.json(summary);
   } catch (err) {
-    res.status(err?.status || 500).json({ error: err?.message || 'Strava error' });
+    res.status(err?.status || 500).json({ error: err?.message || 'Strava error', code: err?.code });
   }
 });
 
-app.get('/strava/activity/:id/streams', async (req, res) => {
+app.get('/strava/activity/:id/streams', requireAuth, async (req, res) => {
   try {
     const id = String(req.params.id || '').trim();
     if (!id) {
@@ -180,86 +290,81 @@ app.get('/strava/activity/:id/streams', async (req, res) => {
     const keys = keysParam
       ? keysParam.split(',').map((s) => s.trim()).filter(Boolean)
       : ['heartrate', 'velocity_smooth', 'time', 'distance', 'altitude', 'cadence'];
-    const streams = await getActivityStreams(id, keys);
+    const streams = await getActivityStreams(req.user.id, id, keys);
     res.json(streams);
   } catch (err) {
-    res.status(err?.status || 500).json({ error: err?.message || 'Strava error' });
+    res.status(err?.status || 500).json({ error: err?.message || 'Strava error', code: err?.code });
   }
 });
 
-app.get('/strava/stats', async (_req, res) => {
+app.get('/strava/stats', requireAuth, async (req, res) => {
   try {
-    const athlete = await getAthlete();
-    const stats = await getAthleteStats(athlete.id);
+    const athlete = await getAthlete(req.user.id);
+    const stats = await getAthleteStats(req.user.id, athlete.id);
     res.json({ athleteId: athlete.id, stats });
   } catch (err) {
-    res.status(err?.status || 500).json({ error: err?.message || 'Strava error' });
+    res.status(err?.status || 500).json({ error: err?.message || 'Strava error', code: err?.code });
   }
 });
 
-// Best efforts are persisted to disk (see backend/.strava-best-efforts.json).
-// Scanning (fetching `best_efforts` per activity) can take 20–40s for a
-// single batch, which is longer than most mobile HTTP clients will wait
-// before giving up with a "Network request failed" error. We therefore
-// run scans in the background on the server and let the client poll for
-// progress via plain GETs (which return the on-disk snapshot instantly).
-let bestEffortsInFlight = null;
-let bestEffortsLastError = null;
+// Best efforts: KV-basert per-user cache + in-flight-lock per userId.
+const bestEffortsInFlight = new Map();
+const bestEffortsLastError = new Map();
 
-function startBestEffortsScan({ batch, reset }) {
-  if (bestEffortsInFlight) return bestEffortsInFlight;
-  bestEffortsInFlight = (async () => {
+function startBestEffortsScan(userId, { batch, reset }) {
+  if (bestEffortsInFlight.has(userId)) return bestEffortsInFlight.get(userId);
+  const p = (async () => {
     try {
-      bestEffortsLastError = null;
-      const data = await getRunningBestEfforts({ batch, reset });
+      bestEffortsLastError.delete(userId);
+      const data = await getRunningBestEfforts(userId, { batch, reset });
       return { ...data, fetchedAt: Date.now() };
     } catch (err) {
-      bestEffortsLastError = err?.message || String(err);
+      bestEffortsLastError.set(userId, err?.message || String(err));
       throw err;
     } finally {
-      bestEffortsInFlight = null;
+      bestEffortsInFlight.delete(userId);
     }
   })();
-  // Prevent unhandled rejection warnings when nobody awaits the scan.
-  bestEffortsInFlight.catch((err) => {
+  p.catch((err) => {
     console.warn('[strava] best-efforts scan failed:', err?.message || err);
   });
-  return bestEffortsInFlight;
+  bestEffortsInFlight.set(userId, p);
+  return p;
 }
 
-app.get('/strava/best-efforts', async (req, res) => {
+app.get('/strava/best-efforts', requireAuth, async (req, res) => {
   try {
     const batch = Math.min(
       Math.max(Number(req.query.batch ?? req.query.limit) || 25, 1),
-      200
+      200,
     );
     const force = req.query.force === '1' || req.query.force === 'true';
     const reset = req.query.reset === '1' || req.query.reset === 'true';
 
-    if ((force || reset) && !bestEffortsInFlight) {
-      startBestEffortsScan({ batch, reset });
+    if ((force || reset) && !bestEffortsInFlight.has(req.user.id)) {
+      startBestEffortsScan(req.user.id, { batch, reset });
     }
 
-    const snapshot = await readBestEffortsSnapshot();
+    const snapshot = await readBestEffortsSnapshot(req.user.id);
     res.json({
       ...snapshot,
-      scanning: Boolean(bestEffortsInFlight),
-      lastError: bestEffortsLastError,
+      scanning: bestEffortsInFlight.has(req.user.id),
+      lastError: bestEffortsLastError.get(req.user.id) || null,
       fetchedAt: Date.now(),
     });
   } catch (err) {
-    res.status(err?.status || 500).json({ error: err?.message || 'Strava error' });
+    res.status(err?.status || 500).json({ error: err?.message || 'Strava error', code: err?.code });
   }
 });
 
-app.post('/strava/best-efforts/reset', async (_req, res) => {
+app.post('/strava/best-efforts/reset', requireAuth, async (req, res) => {
   try {
-    if (bestEffortsInFlight) {
+    if (bestEffortsInFlight.has(req.user.id)) {
       res.status(409).json({ error: 'Scan pågår – vent til den er ferdig før du nullstiller.' });
       return;
     }
-    await resetBestEffortsCache();
-    bestEffortsLastError = null;
+    await resetBestEffortsCache(req.user.id);
+    bestEffortsLastError.delete(req.user.id);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err?.message || 'Reset failed' });
@@ -349,13 +454,13 @@ function getTools() {
   ];
 }
 
-async function runToolCall(name, args) {
+async function runToolCall(name, args, ctx) {
   if (name === 'get_training_summary') {
     const schema = z.object({ days: z.number().int().min(1).max(90).default(7) });
     const { days } = schema.parse(args ?? {});
 
     try {
-      const summary = await getRecentActivitiesSummary({ days, perPage: 50 });
+      const summary = await getRecentActivitiesSummary(ctx.userId, { days, perPage: 50 });
       const t = summary.totals;
 
       const bullets = [
@@ -378,14 +483,16 @@ async function runToolCall(name, args) {
         bullets: [...bullets, ...(recent.length ? ['', 'Siste økter:'] : []), ...recent],
       };
     } catch (err) {
+      const isNotConnected = err?.code === 'STRAVA_NOT_CONNECTED';
       return {
         kind: 'tool_card',
         title: `Treningsoppsummering (siste ${days} dager)`,
-        bullets: [
-          'Klarte ikke å hente data fra Strava.',
-          String(err?.message || err),
-          'Sjekk at STRAVA_* er satt i backend/.env.',
-        ],
+        bullets: isNotConnected
+          ? [
+              'Du har ikke koblet til Strava enda.',
+              'Gå til Innstillinger → Strava og trykk «Koble til Strava».',
+            ]
+          : ['Klarte ikke å hente data fra Strava.', String(err?.message || err)],
       };
     }
   }
@@ -461,9 +568,9 @@ async function runToolCall(name, args) {
   return { kind: 'tool_card', title: `Ukjent tool: ${name}`, bullets: ['Denne toolen finnes ikke på serveren.'] };
 }
 
-async function safeRunToolCall(name, args) {
+async function safeRunToolCall(name, args, ctx) {
   try {
-    return await runToolCall(name, args);
+    return await runToolCall(name, args, ctx);
   } catch (err) {
     return {
       kind: 'tool_card',
@@ -476,19 +583,19 @@ async function safeRunToolCall(name, args) {
   }
 }
 
-// ---- Chat API (SSE streaming) ----------------------------------------------
+// ---- Chat API --------------------------------------------------------------
 const ChatRequestSchema = z.object({
   messages: z
     .array(
       z.object({
-        role: z.enum(['system', 'user', 'assistant', 'tool']),
+        role: z.enum(['system', 'user', 'assistant']),
         content: z.string(),
-      })
+      }),
     )
     .min(1),
 });
 
-app.post('/chat/stream', async (req, res) => {
+app.post('/chat/stream', requireAuth, async (req, res) => {
   const parse = ChatRequestSchema.safeParse(req.body);
   if (!parse.success) {
     res.status(400).json({ error: 'Invalid payload' });
@@ -545,7 +652,7 @@ app.post('/chat/stream', async (req, res) => {
         }
         send('tool_call', { name: toolCallName, args: parsedArgs });
 
-        const toolResult = await safeRunToolCall(toolCallName, parsedArgs);
+        const toolResult = await safeRunToolCall(toolCallName, parsedArgs, { userId: req.user.id });
         send('tool_result', toolResult);
 
         const followUp = await getOpenAI().chat.completions.create({
@@ -598,7 +705,7 @@ app.post('/chat/stream', async (req, res) => {
   }
 });
 
-app.post('/chat', async (req, res) => {
+app.post('/chat', requireAuth, async (req, res) => {
   const parse = ChatRequestSchema.safeParse(req.body);
   if (!parse.success) {
     console.error('[/chat] invalid payload', parse.error?.issues);
@@ -609,7 +716,7 @@ app.post('/chat', async (req, res) => {
   try {
     const tools = getTools();
 
-    console.log(`[/chat] calling OpenAI (${parse.data.messages.length} messages)`);
+    console.log(`[/chat] user=${req.user.id} calling OpenAI (${parse.data.messages.length} messages)`);
     const first = await getOpenAI().chat.completions.create({
       model: OPENAI_MODEL,
       messages: parse.data.messages,
@@ -636,7 +743,7 @@ app.post('/chat', async (req, res) => {
       }
 
       console.log(`[/chat] tool_call name=${name} args=${rawArgs.slice(0, 200)}`);
-      const toolResult = await safeRunToolCall(name, args);
+      const toolResult = await safeRunToolCall(name, args, { userId: req.user.id });
       console.log(`[/chat] tool_call result kind=${toolResult?.kind || 'unknown'}`);
 
       console.log('[/chat] calling OpenAI follow-up');
@@ -688,7 +795,7 @@ const SessionFeedbackSchema = z.object({
   source: z.enum(['manual', 'strava']).optional().default('manual'),
 });
 
-app.post('/chat/session-feedback', async (req, res) => {
+app.post('/chat/session-feedback', requireAuth, async (req, res) => {
   const parse = SessionFeedbackSchema.safeParse(req.body);
   if (!parse.success) {
     console.error('[/chat/session-feedback] invalid payload', parse.error?.issues);

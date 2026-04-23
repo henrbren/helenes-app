@@ -12,6 +12,7 @@
     { "source": "/strava/(.*)", "destination": "/api/server" },
     { "source": "/chat", "destination": "/api/server" },
     { "source": "/chat/(.*)", "destination": "/api/server" },
+    { "source": "/auth/(.*)", "destination": "/api/server" },
     {
       "source": "/((?!_expo/|favicon\\.ico|favicon\\.png|metadata.json).*)",
       "destination": "/index.html"

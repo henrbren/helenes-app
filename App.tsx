@@ -32,6 +32,7 @@ import {
   SafeAreaView,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -40,6 +41,15 @@ import {
 import { GestureHandlerRootView, Swipeable } from 'react-native-gesture-handler';
 import PagerHost, { type PagerHostHandle } from './PagerHost';
 import Svg, { Line as SvgLine, Polygon as SvgPolygon, Polyline, Text as SvgText } from 'react-native-svg';
+import {
+  apiFetch,
+  AuthGate,
+  AuthProvider,
+  useAuth,
+  useUserId,
+  userKey,
+  type AuthUser,
+} from './auth';
 
 const STORAGE_KEY = 'training-log-ios:sessions:v1';
 const CHAT_STORAGE_KEY = 'training-log-ios:chat:v1';
@@ -186,6 +196,15 @@ function apiBaseFromEnv(): string | null {
 function apiBaseFromAppExtra(): string | null {
   const u = (Constants.expoConfig?.extra as { apiUrl?: string } | undefined)?.apiUrl?.trim();
   return u ? normalizeApiBase(u) : null;
+}
+
+/**
+ * Autoritativ API-base fra app-konfigurasjon (Vercel). Null dersom ingen er satt.
+ * Brukes både for å tvinge chat mot Vercel selv lokalt og for å låse server-feltet
+ * i innstillinger inntil «Overstyr (avansert)» er slått på.
+ */
+function configuredApiBase(): string | null {
+  return apiBaseFromEnv() || apiBaseFromAppExtra();
 }
 
 function resolveDefaultServerUrl(): string {
@@ -584,7 +603,15 @@ function Chip({
   style?: ViewStyle;
 }) {
   return (
-    <Pressable onPress={onPress} style={[styles.chip, active ? styles.chipActive : styles.chipInactive, style]}>
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.chip,
+        active ? styles.chipActive : styles.chipInactive,
+        pressed && { opacity: 0.75, transform: [{ scale: 0.97 }] },
+        style,
+      ]}
+    >
       <Text style={[styles.chipText, active ? styles.chipTextActive : styles.chipTextInactive]}>{label}</Text>
     </Pressable>
   );
@@ -592,7 +619,10 @@ function Chip({
 
 function PrimaryButton({ label, onPress }: { label: string; onPress: () => void }) {
   return (
-    <Pressable onPress={onPress} style={styles.pinkButtonFull}>
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [styles.pinkButtonFull, pressed && { opacity: 0.8, transform: [{ scale: 0.98 }] }]}
+    >
       <Text style={styles.pinkButtonText}>{label}</Text>
     </Pressable>
   );
@@ -667,27 +697,27 @@ function describeStravaActivityShortLine(a: StravaActivity): string {
 }
 
 async function getServerUrl(): Promise<string> {
-  const fromEnv = apiBaseFromEnv();
-  if (fromEnv) return fromEnv;
-  const fromExtra = apiBaseFromAppExtra();
-  if (fromExtra) return fromExtra;
+  const configured = configuredApiBase();
+
+  // Lagret "overstyring (avansert)" er eneste måte å peke mot lokal backend
+  // når app-konfig har en autoritativ Vercel-URL. Uten flagget bruker vi alltid
+  // Vercel-URL-en, også lokalt – slik at chat + Strava-state er konsistent.
   try {
     const raw = await AsyncStorage.getItem(CHAT_CONFIG_KEY);
     if (raw) {
-      const cfg = JSON.parse(raw) as { serverUrl?: string };
-      if (cfg?.serverUrl) {
+      const cfg = JSON.parse(raw) as { serverUrl?: string; overrideEnabled?: boolean };
+      if (cfg?.overrideEnabled && cfg?.serverUrl) {
         if (isLikelyBundlerOrStaticDevUrl(cfg.serverUrl)) {
-          return resolveDefaultServerUrl();
+          return configured || resolveDefaultServerUrl();
         }
-        const savedIsLocalhost = /(localhost|127\.0\.0\.1)/.test(cfg.serverUrl);
-        const detected = resolveDefaultServerUrl();
-        const detectedIsLan = !/(localhost|127\.0\.0\.1)/.test(detected);
-        return savedIsLocalhost && detectedIsLan ? detected : coerceChatServerUrl(cfg.serverUrl);
+        return coerceChatServerUrl(cfg.serverUrl);
       }
     }
   } catch {
     // ignore
   }
+
+  if (configured) return configured;
   return resolveDefaultServerUrl();
 }
 
@@ -700,6 +730,10 @@ function StravaCard({
   refreshSignal?: number;
   onNewActivity?: (activity: StravaActivity) => void;
 }) {
+  const userId = useUserId();
+  const stravaCacheKey = userKey(STRAVA_CACHE_KEY, userId);
+  const stravaConnectedKey = userKey(STRAVA_CONNECTED_KEY, userId);
+  const stravaSeenIdsKey = userKey(STRAVA_SEEN_IDS_KEY, userId);
   const [data, setData] = useState<StravaRecent | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -718,8 +752,8 @@ function StravaCard({
     (async () => {
       try {
         const [raw, rawConnected] = await Promise.all([
-          AsyncStorage.getItem(STRAVA_CACHE_KEY),
-          AsyncStorage.getItem(STRAVA_CONNECTED_KEY),
+          AsyncStorage.getItem(stravaCacheKey),
+          AsyncStorage.getItem(stravaConnectedKey),
         ]);
         if (raw) setData(JSON.parse(raw) as StravaRecent);
         setIsConnected(rawConnected === '1');
@@ -727,7 +761,7 @@ function StravaCard({
         // ignore
       }
     })();
-  }, []);
+  }, [stravaCacheKey, stravaConnectedKey]);
 
   /**
    * Sammenlign de hentede aktivitetene mot tidligere "sett"-IDer (i AsyncStorage).
@@ -740,7 +774,7 @@ function StravaCard({
     let seen: Set<string> = new Set();
     let isFirstTime = false;
     try {
-      const raw = await AsyncStorage.getItem(STRAVA_SEEN_IDS_KEY);
+      const raw = await AsyncStorage.getItem(stravaSeenIdsKey);
       if (raw) {
         const parsed = JSON.parse(raw) as unknown;
         if (Array.isArray(parsed)) {
@@ -758,7 +792,7 @@ function StravaCard({
     const currentIds = activities.map((a) => String(a.id));
     if (isFirstTime) {
       // Bare lagre det vi ser nå – ikke kommenter eldre økter på første sync.
-      await AsyncStorage.setItem(STRAVA_SEEN_IDS_KEY, JSON.stringify(currentIds)).catch(
+      await AsyncStorage.setItem(stravaSeenIdsKey, JSON.stringify(currentIds)).catch(
         () => undefined,
       );
       return;
@@ -777,31 +811,30 @@ function StravaCard({
     // Behold sett-listen avgrenset: union av forrige + nye, kuttet til rimelig størrelse.
     const merged = new Set<string>([...currentIds, ...Array.from(seen)]);
     const trimmed = Array.from(merged).slice(0, 500);
-    await AsyncStorage.setItem(STRAVA_SEEN_IDS_KEY, JSON.stringify(trimmed)).catch(
+    await AsyncStorage.setItem(stravaSeenIdsKey, JSON.stringify(trimmed)).catch(
       () => undefined,
     );
-  }, []);
+  }, [stravaSeenIdsKey]);
 
   const refresh = useCallback(async () => {
     setIsLoading(true);
     setError(null);
     setNeedsAuth(false);
     try {
-      const base = await getServerUrl();
-      const resp = await fetch(joinApiUrl(base, '/strava/recent?days=14'));
+      const resp = await apiFetch('/strava/recent?days=14');
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) {
         const msg = String((body as any)?.error || `HTTP ${resp.status}`);
-        if (msg.includes('401') || /authoriz/i.test(msg) || /missing/i.test(msg)) {
+        if (msg.includes('401') || /authoriz/i.test(msg) || /missing/i.test(msg) || /STRAVA_NOT_CONNECTED/.test(msg)) {
           setNeedsAuth(true);
         }
         throw new Error(msg);
       }
       const fresh: StravaRecent = { ...(body as StravaRecent), fetchedAt: Date.now() };
       setData(fresh);
-      await AsyncStorage.setItem(STRAVA_CACHE_KEY, JSON.stringify(fresh));
+      await AsyncStorage.setItem(stravaCacheKey, JSON.stringify(fresh));
       setIsConnected(true);
-      await AsyncStorage.setItem(STRAVA_CONNECTED_KEY, '1');
+      await AsyncStorage.setItem(stravaConnectedKey, '1');
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       // Detekter nye aktiviteter etter en vellykket sync.
       void reportNewActivities(fresh.activities || []);
@@ -811,7 +844,7 @@ function StravaCard({
     } finally {
       setIsLoading(false);
     }
-  }, [reportNewActivities]);
+  }, [reportNewActivities, stravaCacheKey, stravaConnectedKey]);
 
   useEffect(() => {
     if (refreshSignal <= 0) return;
@@ -857,7 +890,7 @@ function StravaCard({
 
         {data && t ? (
           <View style={styles.metricsRow}>
-            <View style={[styles.metricTile, styles.metricTileFirst]}>
+            <View style={styles.metricTile}>
               <Text style={styles.metricLabel}>Økter (14d)</Text>
               <Text style={styles.metricValue}>{t.count}</Text>
             </View>
@@ -865,7 +898,7 @@ function StravaCard({
               <Text style={styles.metricLabel}>Distanse</Text>
               <Text style={styles.metricValue}>{t.distanceKm.toFixed(1)} km</Text>
             </View>
-            <View style={[styles.metricTile, styles.metricTileLast]}>
+            <View style={styles.metricTile}>
               <Text style={styles.metricLabel}>Stigning</Text>
               <Text style={styles.metricValue}>{t.elevationMeters} m</Text>
             </View>
@@ -1143,12 +1176,8 @@ function StravaActivityDetailModal({
       setError(null);
       setStreams(null);
       try {
-        const base = await getServerUrl();
-        const resp = await fetch(
-          joinApiUrl(
-            base,
-            `/strava/activity/${activity.id}/streams?keys=heartrate,velocity_smooth,distance,time`,
-          ),
+        const resp = await apiFetch(
+          `/strava/activity/${activity.id}/streams?keys=heartrate,velocity_smooth,distance,time`,
         );
         const body = await resp.json().catch(() => ({}));
         if (!resp.ok) {
@@ -1271,7 +1300,7 @@ function StravaActivityDetailModal({
                 {formatNorwegianDate(activity.startDate?.slice(0, 10) || '')} · {activity.type}
               </Text>
               <View style={styles.metricsRow}>
-                <View style={[styles.metricTile, styles.metricTileFirst]}>
+                <View style={styles.metricTile}>
                   <Text style={styles.metricLabel}>Distanse</Text>
                   <Text style={styles.metricValue}>{activity.distanceKm.toFixed(2)} km</Text>
                 </View>
@@ -1279,7 +1308,7 @@ function StravaActivityDetailModal({
                   <Text style={styles.metricLabel}>Tid</Text>
                   <Text style={styles.metricValue}>{formatDuration(activity.movingMinutes)}</Text>
                 </View>
-                <View style={[styles.metricTile, styles.metricTileLast]}>
+                <View style={styles.metricTile}>
                   <Text style={styles.metricLabel}>Snittpuls</Text>
                   <Text style={styles.metricValue}>
                     {activity.averageHeartrate ? `${Math.round(activity.averageHeartrate)}` : '–'}
@@ -1723,6 +1752,8 @@ function StravaStatsCard({
   onAllRunTotalsChange?: (totals: { distanceMeters: number | null; movingSeconds: number | null }) => void;
   refreshSignal?: number;
 }) {
+  const userId = useUserId();
+  const statsCacheKey = userKey(STRAVA_STATS_CACHE_KEY, userId);
   const [data, setData] = useState<StravaStats | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1730,13 +1761,13 @@ function StravaStatsCard({
   useEffect(() => {
     (async () => {
       try {
-        const raw = await AsyncStorage.getItem(STRAVA_STATS_CACHE_KEY);
+        const raw = await AsyncStorage.getItem(statsCacheKey);
         if (raw) setData(JSON.parse(raw) as StravaStats);
       } catch {
         // ignore
       }
     })();
-  }, []);
+  }, [statsCacheKey]);
 
   useEffect(() => {
     onAllRunTotalsChange?.({
@@ -1749,13 +1780,12 @@ function StravaStatsCard({
     setIsLoading(true);
     setError(null);
     try {
-      const base = await getServerUrl();
-      const resp = await fetch(joinApiUrl(base, '/strava/stats'));
+      const resp = await apiFetch('/strava/stats');
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) throw new Error(String((body as any)?.error || `HTTP ${resp.status}`));
       const fresh: StravaStats = { ...(body as StravaStats), fetchedAt: Date.now() };
       setData(fresh);
-      await AsyncStorage.setItem(STRAVA_STATS_CACHE_KEY, JSON.stringify(fresh));
+      await AsyncStorage.setItem(statsCacheKey, JSON.stringify(fresh));
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } catch (e: any) {
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
@@ -1763,7 +1793,7 @@ function StravaStatsCard({
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [statsCacheKey]);
 
   useEffect(() => {
     void refresh();
@@ -1954,6 +1984,8 @@ function StravaBestEffortsCard({
 }: {
   defaultExpanded?: boolean;
 } = {}) {
+  const userId = useUserId();
+  const bestEffortsCacheKey = userKey(STRAVA_BEST_EFFORTS_CACHE_KEY, userId);
   const [data, setData] = useState<StravaBestEfforts | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1989,22 +2021,20 @@ function StravaBestEffortsCard({
     if (snapshot.efforts.length === 0 && snapshot.scannedRuns === 0) return;
     try {
       await AsyncStorage.setItem(
-        STRAVA_BEST_EFFORTS_CACHE_KEY,
+        bestEffortsCacheKey,
         JSON.stringify(snapshot),
       );
     } catch {
       // ignore
     }
-  }, []);
+  }, [bestEffortsCacheKey]);
 
   const fetchSnapshot = useCallback(
     async (force: boolean): Promise<StravaBestEfforts> => {
-      const base = await getServerUrl();
       const suffix = force ? '?batch=25&force=1' : '';
-      const resp = await fetchWithTimeout(
-        joinApiUrl(base, `/strava/best-efforts${suffix}`),
-        {},
-        15000,
+      const resp = await apiFetch(
+        `/strava/best-efforts${suffix}`,
+        { timeoutMs: 15000 },
       );
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) {
@@ -2060,7 +2090,7 @@ function StravaBestEffortsCard({
     let cancelled = false;
     (async () => {
       try {
-        const raw = await AsyncStorage.getItem(STRAVA_BEST_EFFORTS_CACHE_KEY);
+        const raw = await AsyncStorage.getItem(bestEffortsCacheKey);
         if (raw && !cancelled) setData(JSON.parse(raw) as StravaBestEfforts);
       } catch {
         // ignore
@@ -2787,7 +2817,7 @@ function RunningProgramTab({
         <View style={styles.programTabTopRow}>
           <Pressable
             onPress={openCreateModal}
-            style={styles.newChecklistButton}
+            style={({ pressed }) => [styles.newChecklistButton, pressed && { opacity: 0.8, transform: [{ scale: 0.98 }] }]}
             accessibilityRole="button"
             accessibilityLabel="Nytt løpeprogram"
           >
@@ -3252,7 +3282,11 @@ function RunningProgramTab({
                                       return { ...d, lines: next };
                                     });
                                   }}
-                                  style={[styles.workoutTypeTile, active ? styles.chipActive : styles.chipInactive]}
+                                  style={({ pressed }) => [
+                                    styles.workoutTypeTile,
+                                    active ? styles.chipActive : styles.chipInactive,
+                                    pressed && { opacity: 0.75, transform: [{ scale: 0.97 }] },
+                                  ]}
                                 >
                                   <Text style={styles.workoutTypeEmoji}>{option.emoji}</Text>
                                   <Text
@@ -3601,17 +3635,14 @@ const ChatTab = React.forwardRef<
   },
   ref,
 ) {
+  const userId = useUserId();
+  const auth = useAuth();
+  const { serverUrl, setServerUrl, resetToDefaultServerUrl, user: authUser, signOut } = auth;
+  const chatApiBase = serverUrl;
+  const chatStorageKey = userKey(CHAT_STORAGE_KEY, userId);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [isSending, setIsSending] = useState(false);
-  const [serverUrl, setServerUrl] = useState(() => coerceChatServerUrl(resolveDefaultServerUrl()));
-  const chatApiBase = useMemo(() => coerceChatServerUrl(serverUrl), [serverUrl]);
-
-  useEffect(() => {
-    if (chatApiBase !== serverUrl) {
-      setServerUrl(chatApiBase);
-    }
-  }, [serverUrl, chatApiBase]);
 
   const listRef = useRef<FlatList<ChatListItem> | null>(null);
   // Track whether the user is near the newest message. On an inverted list
@@ -3641,65 +3672,37 @@ const ChatTab = React.forwardRef<
     return items;
   }, [messages, isSending]);
 
+  // Last inn lagret chat-historikk for den innloggede brukeren. Server-URL
+  // håndteres av AuthProvider – ikke ChatTab – slik at alle API-kall (auth,
+  // Strava og chat) deler samme base og ikke kan komme i utakt.
   useEffect(() => {
     (async () => {
       try {
-        const [rawMessages, rawCfg] = await Promise.all([
-          AsyncStorage.getItem(CHAT_STORAGE_KEY),
-          AsyncStorage.getItem(CHAT_CONFIG_KEY),
-        ]);
-
-        if (rawCfg) {
-          const cfg = JSON.parse(rawCfg) as { serverUrl?: string };
-          if (cfg?.serverUrl) {
-            if (isLikelyBundlerOrStaticDevUrl(cfg.serverUrl)) {
-              setServerUrl(resolveDefaultServerUrl());
-            } else {
-              // HTTPS-side som https://*.vercel.app kan ikke kalle http:// (mixed content) → Failed to fetch.
-              const pageHttps =
-                Platform.OS === 'web' &&
-                !__DEV__ &&
-                typeof window !== 'undefined' &&
-                window.location.protocol === 'https:';
-              if (pageHttps && /^http:\/\//i.test(cfg.serverUrl)) {
-                setServerUrl(normalizeApiBase(window.location.origin));
-              } else {
-                const savedIsLocalhost = /(localhost|127\.0\.0\.1)/.test(cfg.serverUrl);
-                const detected = resolveDefaultServerUrl();
-                const detectedIsLan = !/(localhost|127\.0\.0\.1)/.test(detected);
-                // If we're on a physical device (auto-detected URL is on the LAN), always
-                // prefer the freshly detected LAN URL — saved URL may point to localhost or
-                // a stale IP from a previous dev session.
-                setServerUrl(
-                  detectedIsLan ? detected : savedIsLocalhost ? detected : coerceChatServerUrl(cfg.serverUrl),
-                );
-              }
-            }
-          }
-        }
-
+        const rawMessages = await AsyncStorage.getItem(chatStorageKey);
         if (rawMessages) {
           const parsed = JSON.parse(rawMessages) as unknown;
-          if (Array.isArray(parsed)) setMessages(parsed as ChatMessage[]);
-        } else {
-          setMessages([
-            {
-              id: String(Date.now()),
-              role: 'assistant',
-              text:
-                'Hei! Jeg er din personlige trener. Jeg kan svare på spørsmål om løping og trening, lage løpeprogrammer du kan lagre som sjekkliste under fanen Løpeprogram, og hente oversikt fra Strava når det er koblet til. Hva lurer du på i dag?',
-              createdAt: Date.now(),
-            },
-          ]);
+          if (Array.isArray(parsed)) {
+            setMessages(parsed as ChatMessage[]);
+            return;
+          }
         }
+        setMessages([
+          {
+            id: String(Date.now()),
+            role: 'assistant',
+            text:
+              'Hei! Jeg er din personlige trener. Jeg kan svare på spørsmål om løping og trening, lage løpeprogrammer du kan lagre som sjekkliste under fanen Løpeprogram, og hente oversikt fra Strava når det er koblet til. Hva lurer du på i dag?',
+            createdAt: Date.now(),
+          },
+        ]);
       } catch {
         // ignore
       }
     })();
-  }, []);
+  }, [chatStorageKey]);
 
   useEffect(() => {
-    AsyncStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(messages)).catch(() => undefined);
+    AsyncStorage.setItem(chatStorageKey, JSON.stringify(messages)).catch(() => undefined);
     // Only auto-scroll to newest when the user is already near the bottom.
     // Otherwise they are browsing history and we must not yank the list.
     if (!isNearBottomRef.current) return;
@@ -3708,11 +3711,7 @@ const ChatTab = React.forwardRef<
     } catch {
       // ignore
     }
-  }, [messages]);
-
-  useEffect(() => {
-    AsyncStorage.setItem(CHAT_CONFIG_KEY, JSON.stringify({ serverUrl })).catch(() => undefined);
-  }, [serverUrl]);
+  }, [messages, chatStorageKey]);
 
   React.useImperativeHandle(
     ref,
@@ -3721,26 +3720,16 @@ const ChatTab = React.forwardRef<
         if (!sessionDescription?.trim()) return false;
         setIsSending(true);
         try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 45000);
-          let resp: Response;
-          try {
-            resp = await fetch(joinApiUrl(chatApiBase, '/chat/session-feedback'), {
-              method: 'POST',
-              headers: {
-                Accept: 'application/json',
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                session: sessionDescription,
-                history: historyDescription || '',
-                source,
-              }),
-              signal: controller.signal,
-            });
-          } finally {
-            clearTimeout(timeoutId);
-          }
+          const resp = await apiFetch('/chat/session-feedback', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              session: sessionDescription,
+              history: historyDescription || '',
+              source,
+            }),
+            timeoutMs: 45000,
+          });
           const raw = await parseFetchJsonBody(resp);
           if (!resp.ok) {
             const body = raw as { error?: string };
@@ -3768,7 +3757,7 @@ const ChatTab = React.forwardRef<
         }
       },
     }),
-    [chatApiBase],
+    [],
   );
 
   async function send() {
@@ -3808,22 +3797,12 @@ const ChatTab = React.forwardRef<
         ],
       };
 
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 45000);
-      let resp: Response;
-      try {
-        resp = await fetch(joinApiUrl(chatApiBase, '/chat'), {
-          method: 'POST',
-          headers: {
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(payload),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timeoutId);
-      }
+      const resp = await apiFetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        timeoutMs: 45000,
+      });
 
       const raw = await parseFetchJsonBody(resp);
 
@@ -3932,7 +3911,7 @@ const ChatTab = React.forwardRef<
                     // Persist synchronously so the flag survives even if the user
                     // switches tab right after (which would unmount ChatTab before
                     // the effect-based save runs).
-                    AsyncStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(next)).catch(
+                    AsyncStorage.setItem(chatStorageKey, JSON.stringify(next)).catch(
                       () => undefined,
                     );
                     return next;
@@ -4040,7 +4019,14 @@ const ChatTab = React.forwardRef<
                 }
               }}
             />
-            <Pressable onPress={send} style={[styles.sendButton, !draft.trim() || isSending ? styles.sendButtonDisabled : null]}>
+            <Pressable
+              onPress={send}
+              style={({ pressed }) => [
+                styles.sendButton,
+                !draft.trim() || isSending ? styles.sendButtonDisabled : null,
+                pressed && draft.trim() && !isSending && { opacity: 0.85, transform: [{ scale: 0.96 }] },
+              ]}
+            >
               <Text style={styles.sendButtonText}>{isSending ? '...' : 'Send'}</Text>
             </Pressable>
           </View>
@@ -4050,102 +4036,98 @@ const ChatTab = React.forwardRef<
       <Modal visible={settingsModalOpen} animationType="slide" onRequestClose={onSettingsModalClose}>
         <SafeAreaView style={styles.modalSafe}>
           <View style={styles.modalHeader}>
-            <Text style={styles.modalTitle}>Chat-innstillinger</Text>
+            <Text style={styles.modalTitle}>Innstillinger</Text>
             <Pressable onPress={onSettingsModalClose} style={styles.modalClose}>
               <Text style={styles.modalCloseText}>Lukk</Text>
             </Pressable>
           </View>
           <ScrollView contentContainerStyle={styles.modalContent} keyboardShouldPersistTaps="handled">
-            <Text style={styles.fieldLabel}>Server-adresse</Text>
-            <Text style={styles.muted}>
-              Standard er API fra app-konfig (Vercel) eller <Text style={{ fontWeight: '800' }}>http://localhost:8787</Text> når du kjører{' '}
-              <Text style={{ fontWeight: '800' }}>backend</Text> lokalt. Skriv kun <Text style={{ fontWeight: '800' }}>rotadressen</Text> (f.eks.{' '}
-              <Text style={{ fontWeight: '800' }}>https://helenes-app.vercel.app</Text>) — <Text style={{ fontWeight: '800' }}>ikke</Text> ta med{' '}
-              <Text style={{ fontWeight: '800' }}>/health</Text> eller <Text style={{ fontWeight: '800' }}>/chat</Text>; de legges til automatisk.{' '}
-              <Text style={{ fontWeight: '800' }}>Ikke</Text> bruk port <Text style={{ fontWeight: '800' }}>8081</Text> (Expo/Metro). iOS Simulator:{' '}
-              <Text style={{ fontWeight: '800' }}>http://localhost:8787</Text>. Fysisk iPhone (samme Wi‑Fi): Mac-ens IP, f.eks.{' '}
-              <Text style={{ fontWeight: '800' }}>http://192.168.1.23:8787</Text>.
-            </Text>
-            <TextInput value={serverUrl} onChangeText={setServerUrl} autoCapitalize="none" autoCorrect={false} style={styles.input} />
+            <Text style={styles.fieldLabel}>Konto</Text>
+            <View style={{ gap: 4 }}>
+              <Text style={{ fontWeight: '700', color: '#0f172a' }}>
+                {authUser?.email || (authUser?.stravaAthleteName
+                  ? `${authUser.stravaAthleteName} (Strava)`
+                  : 'Innlogget bruker')}
+              </Text>
+              {authUser?.stravaAthleteId ? (
+                <Text style={styles.muted}>
+                  Strava-konto koblet til (athlete #{authUser.stravaAthleteId}
+                  {authUser.stravaAthleteName ? ` · ${authUser.stravaAthleteName}` : ''}).
+                </Text>
+              ) : (
+                <Text style={styles.muted}>Ingen Strava-konto koblet til ennå.</Text>
+              )}
+            </View>
+            <Pressable
+              onPress={() => {
+                void Haptics.selectionAsync();
+                Alert.alert('Logg ut?', 'Du kan logge inn igjen når som helst.', [
+                  { text: 'Avbryt', style: 'cancel' },
+                  {
+                    text: 'Logg ut',
+                    style: 'destructive',
+                    onPress: async () => {
+                      try {
+                        await signOut();
+                      } finally {
+                        onSettingsModalClose();
+                      }
+                    },
+                  },
+                ]);
+              }}
+              style={[styles.dangerButton, { marginTop: 8 }]}
+            >
+              <Text style={styles.dangerButtonText}>Logg ut</Text>
+            </Pressable>
 
+            <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Strava</Text>
+            <Text style={styles.muted}>
+              Koble til din egen Strava-konto for å hente aktiviteter og statistikk. Vi lagrer
+              tokenet ditt trygt knyttet til kontoen din på serveren.
+            </Text>
             <View style={{ flexDirection: 'row', gap: 10 }}>
               <Pressable
-                onPress={() => {
+                onPress={async () => {
                   void Haptics.selectionAsync();
-                  setServerUrl(coerceChatServerUrl(resolveDefaultServerUrl()));
+                  await auth.openStravaConnect();
                 }}
                 style={[styles.secondaryButtonFull, { flex: 1 }]}
               >
-                <Text style={styles.secondaryButtonText}>Auto-oppdag</Text>
+                <Text style={styles.secondaryButtonText}>
+                  {authUser?.stravaAthleteId ? 'Koble på nytt' : 'Koble til Strava'}
+                </Text>
               </Pressable>
               <Pressable
                 onPress={async () => {
                   void Haptics.selectionAsync();
+                  const keysToClear = [
+                    userKey(STRAVA_CACHE_KEY, userId),
+                    userKey(STRAVA_STATS_CACHE_KEY, userId),
+                    userKey(STRAVA_BEST_EFFORTS_CACHE_KEY, userId),
+                    userKey(STRAVA_CONNECTED_KEY, userId),
+                    userKey(STRAVA_SEEN_IDS_KEY, userId),
+                  ];
+                  await Promise.all(
+                    keysToClear.map((k) => AsyncStorage.removeItem(k).catch(() => undefined)),
+                  );
                   try {
-                    const resp = await fetch(joinApiUrl(chatApiBase, '/health'));
-                    if (resp.ok) {
-                      Alert.alert('Tilkoblet', `Serveren svarer på ${chatApiBase}.`);
-                    } else {
-                      Alert.alert('Feil', `Serveren svarte med status ${resp.status}.`);
-                    }
-                  } catch (e: any) {
-                    Alert.alert(
-                      'Ingen kontakt',
-                      `Kunne ikke nå ${chatApiBase}.\n\nSjekk at serveren kjører: \n\ncd backend && npm run dev\n\nFeil: ${String(e?.message || e)}`,
-                    );
+                    await apiFetch('/strava/best-efforts/reset', { method: 'POST' });
+                  } catch {
+                    // ignore — local clear already happened
                   }
+                  Alert.alert(
+                    'Nullstilt',
+                    'Strava-cachen for denne kontoen er slettet lokalt og på serveren. For å koble helt fra må du evt. revoke på strava.com/settings/apps.',
+                  );
                 }}
-                style={[styles.primaryButtonFull, { flex: 1 }]}
+                style={[styles.dangerButton, { flex: 1 }]}
               >
-                <Text style={styles.primaryButtonText}>Test tilkobling</Text>
+                <Text style={styles.dangerButtonText}>Nullstill cache</Text>
               </Pressable>
             </View>
 
-            <View style={{ marginTop: 18, gap: 10 }}>
-              <Text style={styles.fieldLabel}>Strava</Text>
-              <Text style={styles.muted}>
-                Koble til Strava for å hente aktiviteter og statistikk. Dette åpner Strava i nettleseren og lagrer tilgang på serveren din.
-              </Text>
-
-              <View style={{ flexDirection: 'row', gap: 10 }}>
-                <Pressable
-                  onPress={async () => {
-                    void Haptics.selectionAsync();
-                    try {
-                      await Linking.openURL(absoluteApiUrl(chatApiBase, '/strava/connect'));
-                    } catch (e: any) {
-                      Alert.alert('Kunne ikke åpne Strava', String(e?.message || e));
-                    }
-                  }}
-                  style={[styles.secondaryButtonFull, { flex: 1 }]}
-                >
-                  <Text style={styles.secondaryButtonText}>Koble til / koble på nytt</Text>
-                </Pressable>
-
-                <Pressable
-                  onPress={async () => {
-                    void Haptics.selectionAsync();
-                    await Promise.all([
-                      AsyncStorage.removeItem(STRAVA_CACHE_KEY).catch(() => undefined),
-                      AsyncStorage.removeItem(STRAVA_STATS_CACHE_KEY).catch(() => undefined),
-                      AsyncStorage.removeItem(STRAVA_BEST_EFFORTS_CACHE_KEY).catch(() => undefined),
-                      AsyncStorage.removeItem(STRAVA_CONNECTED_KEY).catch(() => undefined),
-                    ]);
-                    try {
-                      const base = await getServerUrl();
-                      await fetch(joinApiUrl(base, '/strava/best-efforts/reset'), { method: 'POST' });
-                    } catch {
-                      // ignore — local clear already happened
-                    }
-                    Alert.alert('Nullstilt', 'Strava-cache er slettet lokalt i appen og på serveren. (For å koble helt fra må du evt. revoke i Strava.)');
-                  }}
-                  style={[styles.dangerButton, { flex: 1 }]}
-                >
-                  <Text style={styles.dangerButtonText}>Nullstill</Text>
-                </Pressable>
-              </View>
-            </View>
-
+            <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Chat-historikk</Text>
             <Pressable
               onPress={() => {
                 void Haptics.selectionAsync();
@@ -4167,7 +4149,7 @@ const ChatTab = React.forwardRef<
                         };
                         setMessages([welcome]);
                         try {
-                          await AsyncStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify([welcome]));
+                          await AsyncStorage.setItem(chatStorageKey, JSON.stringify([welcome]));
                         } catch {
                           // ignore
                         }
@@ -4182,6 +4164,52 @@ const ChatTab = React.forwardRef<
             >
               <Text style={styles.dangerButtonText}>Tøm chat-historikk</Text>
             </Pressable>
+
+            <Text style={[styles.fieldLabel, { marginTop: 18 }]}>Avansert: server-adresse</Text>
+            <Text style={styles.muted}>
+              Brukes bare av utviklere. Standardverdi er fra app-konfigurasjonen (Vercel) eller{' '}
+              <Text style={{ fontWeight: '800' }}>http://localhost:8787</Text> når du kjører backend
+              lokalt.
+            </Text>
+            <TextInput
+              value={serverUrl}
+              onChangeText={setServerUrl}
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={styles.input}
+            />
+            <View style={{ flexDirection: 'row', gap: 10 }}>
+              <Pressable
+                onPress={() => {
+                  void Haptics.selectionAsync();
+                  resetToDefaultServerUrl();
+                }}
+                style={[styles.secondaryButtonFull, { flex: 1 }]}
+              >
+                <Text style={styles.secondaryButtonText}>Auto-oppdag</Text>
+              </Pressable>
+              <Pressable
+                onPress={async () => {
+                  void Haptics.selectionAsync();
+                  try {
+                    const resp = await apiFetch('/health', { skipAuth: true });
+                    if (resp.ok) {
+                      Alert.alert('Tilkoblet', `Serveren svarer på ${chatApiBase}.`);
+                    } else {
+                      Alert.alert('Feil', `Serveren svarte med status ${resp.status}.`);
+                    }
+                  } catch (e: any) {
+                    Alert.alert(
+                      'Ingen kontakt',
+                      `Kunne ikke nå ${chatApiBase}.\n\nFeil: ${String(e?.message || e)}`,
+                    );
+                  }
+                }}
+                style={[styles.primaryButtonFull, { flex: 1 }]}
+              >
+                <Text style={styles.primaryButtonText}>Test tilkobling</Text>
+              </Pressable>
+            </View>
           </ScrollView>
         </SafeAreaView>
       </Modal>
@@ -4508,7 +4536,7 @@ function SessionModal({
           <View style={styles.fieldRow}>
             <View style={styles.fieldHalf}>
               <Text style={styles.fieldLabel}>Dato</Text>
-              <Pressable onPress={() => setShowDatePicker(true)} style={styles.dropdownButton}>
+              <Pressable onPress={() => setShowDatePicker(true)} style={({ pressed }) => [styles.dropdownButton, pressed && { opacity: 0.7 }]}>
                 <Text style={[styles.dropdownButtonText, !form.date && styles.dropdownButtonPlaceholder]}>
                   {displayDate(form.date)}
                 </Text>
@@ -4517,7 +4545,7 @@ function SessionModal({
             </View>
             <View style={styles.fieldHalf}>
               <Text style={styles.fieldLabel}>Tid</Text>
-              <Pressable onPress={() => setShowTimePicker(true)} style={styles.dropdownButton}>
+              <Pressable onPress={() => setShowTimePicker(true)} style={({ pressed }) => [styles.dropdownButton, pressed && { opacity: 0.7 }]}>
                 <Text style={[styles.dropdownButtonText, !form.time && styles.dropdownButtonPlaceholder]}>
                   {displayTime(form.time)}
                 </Text>
@@ -4531,7 +4559,7 @@ function SessionModal({
               <View style={styles.fieldRow}>
                 <View style={styles.fieldHalf}>
                   <Text style={styles.fieldLabel}>Distanse</Text>
-                  <Pressable onPress={() => setShowDistancePicker(true)} style={styles.dropdownButton}>
+                  <Pressable onPress={() => setShowDistancePicker(true)} style={({ pressed }) => [styles.dropdownButton, pressed && { opacity: 0.7 }]}>
                     <Text style={[styles.dropdownButtonText, !form.distance && styles.dropdownButtonPlaceholder]}>
                       {displayDistance(form.distance)}
                     </Text>
@@ -4539,7 +4567,7 @@ function SessionModal({
                 </View>
                 <View style={styles.fieldHalf}>
                   <Text style={styles.fieldLabel}>Gjennomsnittspuls</Text>
-                  <Pressable onPress={() => setShowHeartRatePicker(true)} style={styles.dropdownButton}>
+                  <Pressable onPress={() => setShowHeartRatePicker(true)} style={({ pressed }) => [styles.dropdownButton, pressed && { opacity: 0.7 }]}>
                     <Text
                       style={[
                         styles.dropdownButtonText,
@@ -4564,7 +4592,7 @@ function SessionModal({
 
               <View style={styles.field}>
                 <Text style={styles.fieldLabel}>Skovalg</Text>
-                <Pressable onPress={() => setShowShoePicker(true)} style={styles.dropdownButton}>
+                <Pressable onPress={() => setShowShoePicker(true)} style={({ pressed }) => [styles.dropdownButton, pressed && { opacity: 0.7 }]}>
                   <Text style={[styles.dropdownButtonText, !form.shoe && styles.dropdownButtonPlaceholder]}>
                     {form.shoe || 'Velg sko'}
                   </Text>
@@ -4581,7 +4609,11 @@ function SessionModal({
                       <Pressable
                         key={option.value}
                         onPress={() => onFieldChange('workoutType', option.value)}
-                        style={[styles.workoutTypeTile, active ? styles.chipActive : styles.chipInactive]}
+                        style={({ pressed }) => [
+                          styles.workoutTypeTile,
+                          active ? styles.chipActive : styles.chipInactive,
+                          pressed && { opacity: 0.75, transform: [{ scale: 0.97 }] },
+                        ]}
                       >
                         <Text style={styles.workoutTypeEmoji}>{option.emoji}</Text>
                         <Text
@@ -4607,7 +4639,11 @@ function SessionModal({
                     <Pressable
                       key={option.value}
                       onPress={() => onFieldChange('workoutType', option.value)}
-                      style={[styles.workoutTypeTile, active ? styles.chipActive : styles.chipInactive]}
+                      style={({ pressed }) => [
+                        styles.workoutTypeTile,
+                        active ? styles.chipActive : styles.chipInactive,
+                        pressed && { opacity: 0.75, transform: [{ scale: 0.97 }] },
+                      ]}
                     >
                       <Text style={styles.workoutTypeEmoji}>{option.emoji}</Text>
                       <Text
@@ -4660,7 +4696,11 @@ function SessionModal({
                           onFieldChange('location', option.value);
                           if (option.value === 'innendors') onFieldChange('weather', '');
                         }}
-                        style={[styles.optionTile, active ? styles.chipActive : styles.chipInactive]}
+                        style={({ pressed }) => [
+                          styles.optionTile,
+                          active ? styles.chipActive : styles.chipInactive,
+                          pressed && { opacity: 0.75, transform: [{ scale: 0.97 }] },
+                        ]}
                       >
                         <Text style={styles.optionTileEmoji}>{option.emoji}</Text>
                         <Text
@@ -4685,7 +4725,11 @@ function SessionModal({
                         <Pressable
                           key={option.value}
                           onPress={() => onFieldChange('weather', option.value)}
-                          style={[styles.weatherTile, active ? styles.chipActive : styles.chipInactive]}
+                          style={({ pressed }) => [
+                            styles.weatherTile,
+                            active ? styles.chipActive : styles.chipInactive,
+                            pressed && { opacity: 0.75, transform: [{ scale: 0.95 }] },
+                          ]}
                         >
                           <Text style={styles.weatherEmoji}>{option.emoji}</Text>
                         </Pressable>
@@ -4711,10 +4755,16 @@ function SessionModal({
           </View>
 
           <View style={{ flexDirection: 'row', gap: 10 }}>
-            <Pressable onPress={onClose} style={styles.secondaryButtonFull}>
+            <Pressable
+              onPress={onClose}
+              style={({ pressed }) => [styles.secondaryButtonFull, pressed && { opacity: 0.7 }]}
+            >
               <Text style={styles.secondaryButtonText}>Avbryt</Text>
             </Pressable>
-            <Pressable onPress={onSubmit} style={styles.primaryButtonFull}>
+            <Pressable
+              onPress={onSubmit}
+              style={({ pressed }) => [styles.primaryButtonFull, pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] }]}
+            >
               <Text style={styles.primaryButtonText}>{isEditing ? 'Lagre endringer' : 'Lagre'}</Text>
             </Pressable>
           </View>
@@ -4879,7 +4929,12 @@ function SessionModal({
   );
 }
 
-export default function App() {
+function AuthenticatedApp() {
+  const userId = useUserId();
+  const sessionsKey = userKey(STORAGE_KEY, userId);
+  const runningProgramsKey = userKey(RUNNING_PROGRAMS_KEY, userId);
+  const stravaCacheKeyForUser = userKey(STRAVA_CACHE_KEY, userId);
+
   const [activeTab, setActiveTab] = useState<Tab>('Chat');
   const [chatSettingsOpen, setChatSettingsOpen] = useState(false);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
@@ -4963,8 +5018,8 @@ export default function App() {
     void Haptics.selectionAsync();
     try {
       const [rawSessions, rawPrograms] = await Promise.all([
-        AsyncStorage.getItem(STORAGE_KEY),
-        AsyncStorage.getItem(RUNNING_PROGRAMS_KEY),
+        AsyncStorage.getItem(sessionsKey),
+        AsyncStorage.getItem(runningProgramsKey),
       ]);
       if (rawSessions) {
         const parsed = JSON.parse(rawSessions) as unknown;
@@ -4981,7 +5036,7 @@ export default function App() {
     // gi Strava-kortene litt tid til å vise spinner før vi skjuler pull-to-refresh
     await new Promise((resolve) => setTimeout(resolve, 700));
     setRefreshing(false);
-  }, []);
+  }, [sessionsKey, runningProgramsKey]);
 
   useEffect(() => {
     if (activeTab !== 'Chat') setChatSettingsOpen(false);
@@ -5016,14 +5071,19 @@ export default function App() {
   );
 
   useEffect(() => {
+    setHasLoaded(false);
     (async () => {
       try {
-        const raw = await AsyncStorage.getItem(STORAGE_KEY);
+        const raw = await AsyncStorage.getItem(sessionsKey);
         if (raw) {
           const parsed = JSON.parse(raw) as unknown;
           if (Array.isArray(parsed)) {
             setSessions(parsed as Session[]);
+          } else {
+            setSessions([]);
           }
+        } else {
+          setSessions([]);
         }
       } catch {
         // ignore; we can still run without persistence
@@ -5031,17 +5091,22 @@ export default function App() {
         setHasLoaded(true);
       }
     })();
-  }, []);
+  }, [sessionsKey]);
 
   useEffect(() => {
+    setRunningProgramsLoaded(false);
     (async () => {
       try {
-        const raw = await AsyncStorage.getItem(RUNNING_PROGRAMS_KEY);
+        const raw = await AsyncStorage.getItem(runningProgramsKey);
         if (raw) {
           const parsed = JSON.parse(raw) as unknown;
           if (Array.isArray(parsed)) {
             setRunningPrograms(parsed as SavedRunningProgram[]);
+          } else {
+            setRunningPrograms([]);
           }
+        } else {
+          setRunningPrograms([]);
         }
       } catch {
         // ignore
@@ -5049,17 +5114,17 @@ export default function App() {
         setRunningProgramsLoaded(true);
       }
     })();
-  }, []);
+  }, [runningProgramsKey]);
 
   useEffect(() => {
     if (!hasLoaded) return;
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)).catch(() => undefined);
-  }, [sessions, hasLoaded]);
+    AsyncStorage.setItem(sessionsKey, JSON.stringify(sessions)).catch(() => undefined);
+  }, [sessions, hasLoaded, sessionsKey]);
 
   useEffect(() => {
     if (!runningProgramsLoaded) return;
-    AsyncStorage.setItem(RUNNING_PROGRAMS_KEY, JSON.stringify(runningPrograms)).catch(() => undefined);
-  }, [runningPrograms, runningProgramsLoaded]);
+    AsyncStorage.setItem(runningProgramsKey, JSON.stringify(runningPrograms)).catch(() => undefined);
+  }, [runningPrograms, runningProgramsLoaded, runningProgramsKey]);
 
   function updateField<K extends keyof SessionForm>(field: K, value: SessionForm[K]) {
     setForm((prev) => ({ ...prev, [field]: value }));
@@ -5179,7 +5244,7 @@ export default function App() {
     async (excludeStravaId?: number, max = 10): Promise<string> => {
       let stravaActivities: StravaActivity[] = [];
       try {
-        const raw = await AsyncStorage.getItem(STRAVA_CACHE_KEY);
+        const raw = await AsyncStorage.getItem(stravaCacheKeyForUser);
         if (raw) {
           const parsed = JSON.parse(raw) as StravaRecent | null;
           stravaActivities = Array.isArray(parsed?.activities) ? parsed!.activities : [];
@@ -5208,7 +5273,7 @@ export default function App() {
       if (all.length === 0) return '';
       return all.map((x) => `• ${x.line}`).join('\n');
     },
-    [sessions],
+    [sessions, stravaCacheKeyForUser],
   );
 
   const handleNewStravaActivity = useCallback(
@@ -5436,7 +5501,7 @@ export default function App() {
                   }}
                   accessibilityRole="button"
                   accessibilityLabel="Innstillinger"
-                  style={styles.chatGearButton}
+                  style={({ pressed }) => [styles.chatGearButton, pressed && { opacity: 0.6, transform: [{ scale: 0.94 }] }]}
                 >
                   <Text style={styles.chatGearIcon}>⚙️</Text>
                 </Pressable>
@@ -5558,7 +5623,11 @@ export default function App() {
                 <Pressable
                   key={tab}
                   onPress={() => handleTabPress(tab)}
-                  style={styles.bottomTabItem}
+                  style={({ pressed }) => [
+                    styles.bottomTabItem,
+                    active && styles.bottomTabItemActive,
+                    pressed && { opacity: 0.7, transform: [{ scale: 0.96 }] },
+                  ]}
                 >
                   <View style={styles.bottomTabIconWrap}>
                     <Text style={[styles.bottomTabIcon, active && styles.bottomTabIconActive]}>{tabIcons[tab]}</Text>
@@ -5702,18 +5771,27 @@ const styles = StyleSheet.create({
   bottomTabBar: {
     flexDirection: 'row',
     backgroundColor: '#ffffff',
-    borderTopWidth: 1,
+    borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: '#e2e8f0',
-    paddingTop: 8,
-    paddingBottom: 8,
-    paddingHorizontal: 8,
+    paddingTop: 6,
+    paddingBottom: 6,
+    paddingHorizontal: 6,
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: -3 },
+    shadowOpacity: 0.06,
+    shadowRadius: 8,
+    elevation: 8,
   },
   bottomTabItem: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 6,
-    gap: 2,
+    paddingVertical: 8,
+    gap: 3,
+    borderRadius: 12,
+  },
+  bottomTabItemActive: {
+    backgroundColor: '#FFF2EB',
   },
   bottomTabIcon: {
     fontSize: 22,
@@ -5800,6 +5878,11 @@ const styles = StyleSheet.create({
     padding: 14,
     borderWidth: 1,
     borderColor: '#e2e8f0',
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 4,
+    elevation: 1,
   },
   cardTitle: {
     fontSize: 16,
@@ -5940,6 +6023,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#e2e8f0',
     overflow: 'hidden',
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.06,
+    shadowRadius: 8,
+    elevation: 3,
   },
   bubbleRow: {
     flexDirection: 'row',
@@ -6469,7 +6557,7 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     gap: 10,
     padding: 12,
-    borderTopWidth: 1,
+    borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: '#e2e8f0',
     backgroundColor: '#ffffff',
   },
@@ -6477,10 +6565,10 @@ const styles = StyleSheet.create({
     flex: 1,
     borderWidth: 1,
     borderColor: '#e2e8f0',
-    backgroundColor: '#ffffff',
-    borderRadius: 16,
+    backgroundColor: '#f8fafc',
+    borderRadius: 20,
     paddingVertical: 10,
-    paddingHorizontal: 12,
+    paddingHorizontal: 14,
     fontSize: 14,
     fontWeight: '600',
     color: '#0f172a',
@@ -6489,8 +6577,8 @@ const styles = StyleSheet.create({
   sendButton: {
     paddingVertical: 12,
     paddingHorizontal: 14,
-    borderRadius: 16,
-    backgroundColor: '#007AFF',
+    borderRadius: 20,
+    backgroundColor: '#C45872',
   },
   sendButtonDisabled: {
     opacity: 0.45,
@@ -6509,13 +6597,13 @@ const styles = StyleSheet.create({
     backgroundColor: '#ffffff',
     borderWidth: 1,
     borderColor: '#e2e8f0',
+    borderRadius: 16,
     padding: 12,
-  },
-  metricTileFirst: {
-    borderRadius: 16,
-  },
-  metricTileLast: {
-    borderRadius: 16,
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 4,
+    elevation: 1,
   },
   metricLabel: {
     fontSize: 12,
@@ -6615,6 +6703,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#e2e8f0',
     gap: 10,
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 4,
+    elevation: 1,
   },
   chartCard: {
     backgroundColor: '#ffffff',
@@ -6623,6 +6716,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#e2e8f0',
     gap: 8,
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 4,
+    elevation: 1,
   },
   chartTitle: {
     fontSize: 14,
@@ -6645,6 +6743,11 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     padding: 12,
     backgroundColor: '#ffffff',
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 4,
+    elevation: 1,
   },
   historySessionCompact: {
     flexDirection: 'row',
@@ -6750,6 +6853,11 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFE8CD',
     borderRadius: 16,
     padding: 14,
+    shadowColor: '#C45872',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08,
+    shadowRadius: 4,
+    elevation: 2,
   },
   statTilePressable: {
     flexDirection: 'row',
@@ -6938,13 +7046,19 @@ const styles = StyleSheet.create({
   },
   programFormModalHeader: {
     paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
+    paddingVertical: 14,
+    borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: '#e2e8f0',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     backgroundColor: '#ffffff',
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.04,
+    shadowRadius: 4,
+    elevation: 2,
+    zIndex: 1,
   },
   programFormModalTitle: {
     fontSize: 18,
@@ -6992,18 +7106,25 @@ const styles = StyleSheet.create({
   },
   modalHeader: {
     paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
+    paddingVertical: 14,
+    borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: '#e2e8f0',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     backgroundColor: '#ffffff',
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.04,
+    shadowRadius: 4,
+    elevation: 2,
+    zIndex: 1,
   },
   modalTitle: {
     fontSize: 18,
     fontWeight: '800',
     color: '#0f172a',
+    letterSpacing: -0.2,
   },
   modalClose: {
     paddingVertical: 8,
@@ -7057,8 +7178,8 @@ const styles = StyleSheet.create({
     borderColor: '#e2e8f0',
     backgroundColor: '#ffffff',
     borderRadius: 14,
-    paddingVertical: 12,
-    paddingHorizontal: 12,
+    paddingVertical: 13,
+    paddingHorizontal: 14,
     fontSize: 14,
     color: '#0f172a',
   },
@@ -7081,8 +7202,13 @@ const styles = StyleSheet.create({
     borderColor: '#e2e8f0',
     backgroundColor: '#ffffff',
     borderRadius: 14,
-    paddingVertical: 12,
-    paddingHorizontal: 12,
+    paddingVertical: 13,
+    paddingHorizontal: 14,
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.03,
+    shadowRadius: 2,
+    elevation: 1,
   },
   dropdownButtonText: {
     fontSize: 14,
@@ -7106,11 +7232,16 @@ const styles = StyleSheet.create({
   },
   dropdownSheet: {
     backgroundColor: '#ffffff',
-    borderRadius: 18,
-    paddingVertical: 12,
-    paddingHorizontal: 8,
+    borderRadius: 20,
+    paddingVertical: 14,
+    paddingHorizontal: 10,
     borderWidth: 1,
     borderColor: '#e2e8f0',
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.15,
+    shadowRadius: 24,
+    elevation: 12,
   },
   dropdownSheetTitle: {
     fontSize: 13,
@@ -7203,3 +7334,13 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
 });
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AuthGate>
+        <AuthenticatedApp />
+      </AuthGate>
+    </AuthProvider>
+  );
+}
