@@ -59,6 +59,8 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 const AUTH_TOKEN_KEY = 'training-log-ios:auth-token:v1';
 const AUTH_USER_KEY = 'training-log-ios:auth-user:v1';
 const CHAT_CONFIG_KEY = 'training-log-ios:chat-config:v1';
+/** Midlertidig lagring når OAuth sender token i URL — unngår race hvis effekten kjører to ganger (Strict Mode) eller URL renses for tidlig. */
+const OAUTH_RETURN_TOKEN_KEY = 'training-log-ios:oauth-return-token';
 const SERVER_PORT = 8787;
 const KNOWN_DEV_BUNDLER_PORTS = new Set(['8081', '8082', '19000', '19001', '19002', '19006', '4173']);
 
@@ -374,7 +376,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [sessionToken, setSessionTokenState] = useState<string | null>(null);
   const [serverUrl, setServerUrlState] = useState<string>(() => resolveDefaultServerUrl());
 
-  currentSessionToken = sessionToken;
+  // Under status === 'loading' kan bootstrap sette currentSessionToken før React state er oppdatert;
+  // ikke nullstill modul-nivå token da — ellers mister apiFetch Authorization midt i /auth/me.
+  if (sessionToken) {
+    currentSessionToken = sessionToken;
+  } else if (status !== 'loading') {
+    currentSessionToken = null;
+  }
   currentUserId = user?.id || null;
   getServerBase = () => serverUrl;
 
@@ -441,13 +449,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           const authOk = u.searchParams.get('auth') === 'ok';
           if (t && authOk) {
             tokenFromQuery = t;
+            try {
+              sessionStorage.setItem(OAUTH_RETURN_TOKEN_KEY, t);
+            } catch {
+              // private mode / lagring blokkert
+            }
           }
-          if (u.searchParams.has('auth') || u.searchParams.has('token') || u.searchParams.has('strava')) {
-            u.searchParams.delete('auth');
-            u.searchParams.delete('token');
-            u.searchParams.delete('strava');
-            window.history.replaceState({}, '', `${u.pathname}${u.search ? `?${u.searchParams}` : ''}${u.hash}`);
-          }
+          // Ikke history.replaceState her: ved dobbelt effekt-kjørsel (React Strict Mode) er token borte
+          // fra URL før andre runden validerer → gammel storedToken → utlogging.
+        } catch {
+          // ignore
+        }
+      }
+
+      let tokenFromOAuthStorage: string | null = null;
+      if (Platform.OS === 'web' && typeof window !== 'undefined') {
+        try {
+          const s = sessionStorage.getItem(OAUTH_RETURN_TOKEN_KEY);
+          if (s) tokenFromOAuthStorage = s;
         } catch {
           // ignore
         }
@@ -471,11 +490,35 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       };
 
-      const effectiveToken = tokenFromQuery || storedToken;
+      /** Etter vellykket OAuth: fjern token fra URL + sessionStorage (sikkerhet / ryddig adressefelt). */
+      const clearOAuthReturnFromBrowser = () => {
+        if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+        try {
+          sessionStorage.removeItem(OAUTH_RETURN_TOKEN_KEY);
+        } catch {
+          // ignore
+        }
+        try {
+          const u = new URL(window.location.href);
+          if (u.searchParams.has('auth') || u.searchParams.has('token') || u.searchParams.has('strava')) {
+            u.searchParams.delete('auth');
+            u.searchParams.delete('token');
+            u.searchParams.delete('strava');
+            window.history.replaceState({}, '', `${u.pathname}${u.search ? `?${u.searchParams}` : ''}${u.hash}`);
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      const effectiveToken = tokenFromQuery || tokenFromOAuthStorage || storedToken;
       if (effectiveToken) {
         const outcome = await tryApplyValidSession(effectiveToken);
-        if (outcome === 'ok') return;
-        if (outcome === 'offline' && !tokenFromQuery && storedToken && storedUser) {
+        if (outcome === 'ok') {
+          clearOAuthReturnFromBrowser();
+          return;
+        }
+        if (outcome === 'offline' && !tokenFromQuery && !tokenFromOAuthStorage && storedToken && storedUser) {
           setSessionTokenState(storedToken);
           setUser(storedUser);
           setStatus('signedIn');
@@ -483,6 +526,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
+      if (Platform.OS === 'web' && typeof window !== 'undefined') {
+        try {
+          sessionStorage.removeItem(OAUTH_RETURN_TOKEN_KEY);
+        } catch {
+          // ignore
+        }
+      }
       await applyAuth({ sessionToken: null, user: null });
     })();
   }, [applyAuth]);
