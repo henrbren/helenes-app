@@ -1,9 +1,18 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "installCommand": "npm install",
+  "installCommand": "npm install && npm install --prefix backend",
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
+  "functions": {
+    "api/server.mjs": {
+      "maxDuration": 60
+    }
+  },
   "rewrites": [
+    { "source": "/health", "destination": "/api/server" },
+    { "source": "/strava/(.*)", "destination": "/api/server" },
+    { "source": "/chat", "destination": "/api/server" },
+    { "source": "/chat/(.*)", "destination": "/api/server" },
     {
       "source": "/((?!_expo/|favicon.ico|metadata.json).*)",
       "destination": "/index.html"

@@ -1,10 +1,25 @@
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const TOKEN_CACHE_PATH = path.join(__dirname, '.strava-tokens.json');
-const BEST_EFFORTS_CACHE_PATH = path.join(__dirname, '.strava-best-efforts.json');
+
+/** På Vercel er prosjektmappa skrivebeskyttet; bruk /tmp (eller sett TRAINING_LOG_DATA_DIR). */
+function getBackendDataDir() {
+  const override = process.env.TRAINING_LOG_DATA_DIR?.trim();
+  if (override) return override;
+  if (process.env.VERCEL) return path.join(os.tmpdir(), 'training-log-backend');
+  return __dirname;
+}
+
+const BACKEND_DATA_DIR = getBackendDataDir();
+const TOKEN_CACHE_PATH = path.join(BACKEND_DATA_DIR, '.strava-tokens.json');
+const BEST_EFFORTS_CACHE_PATH = path.join(BACKEND_DATA_DIR, '.strava-best-efforts.json');
+
+async function ensureDataDir() {
+  await fs.mkdir(BACKEND_DATA_DIR, { recursive: true });
+}
 
 const STRAVA_OAUTH_URL = 'https://www.strava.com/oauth/token';
 const STRAVA_AUTHORIZE_URL = 'https://www.strava.com/oauth/authorize';
@@ -34,6 +49,7 @@ async function readCachedTokens() {
 
 async function persistTokens(tokens) {
   try {
+    await ensureDataDir();
     await fs.writeFile(TOKEN_CACHE_PATH, JSON.stringify(tokens, null, 2), 'utf8');
   } catch (err) {
     console.warn('[strava] could not persist refreshed tokens:', err?.message || err);
@@ -331,6 +347,7 @@ async function loadBestEffortsDiskCache() {
 
 async function persistBestEffortsDiskCache(data) {
   try {
+    await ensureDataDir();
     await fs.writeFile(BEST_EFFORTS_CACHE_PATH, JSON.stringify(data, null, 2), 'utf8');
   } catch (err) {
     console.warn('[strava] could not persist best efforts cache:', err?.message || err);
